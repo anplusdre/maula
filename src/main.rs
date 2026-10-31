@@ -11,6 +11,7 @@ mod term;
 mod ttf;
 mod width;
 mod win;
+mod window;
 
 use config::{Config, PanelCfg, SavedSpace, Theme, THEME_NAMES};
 use gfx::{blend, Canvas, Font, Rect};
@@ -18,19 +19,10 @@ use picker::{Kind, Picker};
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 use suggest::Suggest;
 use term::{Term, BLANK};
-use winit::{
-    application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalSize},
-    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::{Key, ModifiersState, NamedKey},
-    raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{CursorIcon, Fullscreen, ResizeDirection, Theme as WinTheme, Window, WindowId},
-};
+use window::{Control, CursorIcon, ElementState, Event, Key, KeyEvent, ModifiersState, MouseButton, MouseScrollDelta, NamedKey, ResizeDirection, Window};
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU32, Ordering},
@@ -128,6 +120,22 @@ enum Ev {
     Output(usize, Vec<u8>),
     Exit(usize),
     Hook(claude::Hook),
+}
+
+/// Hands `Ev`s from other threads (shell output, hooks) to the UI thread, waking its event loop.
+#[derive(Clone)]
+struct Proxy {
+    tx: std::sync::mpsc::Sender<Ev>,
+    waker: window::Waker,
+}
+
+impl Proxy {
+    /// Err once the UI is gone: the sending thread can stop.
+    fn send_event(&self, ev: Ev) -> Result<(), ()> {
+        self.tx.send(ev).map_err(drop)?;
+        self.waker.wake();
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -230,7 +238,7 @@ fn shell_command(shell: Option<&str>) -> (String, Vec<&'static str>, Vec<(&'stat
 }
 
 /// `ipc`: the hook listener's (port, token), handed to the shell so `maula hook` can report back to this panel.
-fn spawn_pty(proxy: &EventLoopProxy<Ev>, id: usize, shell: Option<&str>, dir: Option<&Path>, ipc: Option<&(u16, String)>) -> (win::Pty, std::fs::File) {
+fn spawn_pty(proxy: &Proxy, id: usize, shell: Option<&str>, dir: Option<&Path>, ipc: Option<&(u16, String)>) -> (win::Pty, std::fs::File) {
     let (exe, args, mut env) = shell_command(shell);
     if let Some((port, token)) = ipc {
         env.extend([("MAULA_PANE", id.to_string()), ("MAULA_PORT", port.to_string()), ("MAULA_TOKEN", token.clone())]);
@@ -277,7 +285,6 @@ fn key_bytes(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Option<Ve
             NamedKey::Delete => "\x1b[3~".into(),
             NamedKey::PageUp => "\x1b[5~".into(),
             NamedKey::PageDown => "\x1b[6~".into(),
-            _ => return None,
         },
         Key::Character(c) => {
             let up = c.chars().next()?.to_ascii_uppercase();
@@ -287,7 +294,6 @@ fn key_bytes(ev: &KeyEvent, mods: ModifiersState, app_cursor: bool) -> Option<Ve
                 c.to_string()
             }
         }
-        _ => return None,
     };
     Some(if alt { format!("\x1b{s}") } else { s }.into_bytes())
 }
@@ -314,14 +320,14 @@ fn title(p: &Pane) -> String {
 }
 
 struct Ui {
-    window: Arc<Window>,
+    window: Window,
     hwnd: isize, // the window, for presenting frames and owning the clipboard
     font: Font,    // terminal (monospace)
     ui_font: Font, // dropdown, popups
     title_font: Font, // panel titles
     icon_font: Font, // Lucide, sized to ICON
     scale: f32,      // display scaling (1.0 = 100%); all design sizes go through `px`
-    proxy: EventLoopProxy<Ev>,
+    proxy: Proxy,
     shell: Option<String>,
     editor: Option<String>, // what Ctrl+click opens file paths in
     search: Option<Search>,
@@ -375,30 +381,16 @@ struct Ui {
 }
 
 impl Ui {
-    fn new(el: &ActiveEventLoop, proxy: EventLoopProxy<Ev>, cfg: Config) -> Ui {
-        let attrs = Window::default_attributes()
-            .with_title("maula")
-            .with_decorations(false) // we draw our own header and caption buttons
-            .with_inner_size(LogicalSize::new(1280.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(480.0, 300.0));
-        #[cfg(windows)]
-        let attrs = {
-            // the icon build.rs embedded (resource 1): title bar, taskbar and Alt+Tab
-            use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
-            let icon = winit::window::Icon::from_resource(1, None).ok();
-            attrs.with_window_icon(icon.clone()).with_taskbar_icon(icon)
-        };
-        let window = Arc::new(el.create_window(attrs).unwrap());
+    fn new(window: Window, proxy: Proxy, cfg: Config) -> Ui {
         let scale = window.scale_factor() as f32;
         let text = text_of(&cfg);
         let ((font, title_font), ui_font) = (text_fonts(text, scale), Font::new(UI_PX * scale));
         let (icon_font, close_font) = (Font::icons(ICON * scale), Font::medium(CLOSE_PX * scale));
-        let hwnd = match window.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-            _ => panic!("not a Win32 window"),
-        };
+        let hwnd = window.hwnd;
         let p = proxy.clone();
-        let ipc = claude::listen(move |h| drop(p.send_event(Ev::Hook(h))));
+        let ipc = claude::listen(move |h| {
+            let _ = p.send_event(Ev::Hook(h));
+        });
         let mut ui = Ui {
             window,
             hwnd,
@@ -505,7 +497,7 @@ impl Ui {
 
     /// Maximized, or in borderless fullscreen (what the maximize button does by default, see MAXIMIZE).
     fn maximized(&self) -> bool {
-        self.window.is_maximized() || self.window.fullscreen().is_some()
+        self.window.is_maximized() || self.window.is_fullscreen()
     }
 
     fn card_w(&self) -> i32 {
@@ -629,7 +621,7 @@ impl Ui {
 
     /// Makes the OS title bar follow the theme (friendly counts as dark: light text on a grey surface).
     fn sync_window_theme(&self) {
-        self.window.set_theme(Some(if self.theme == 0 { WinTheme::Light } else { WinTheme::Dark }));
+        self.window.set_dark(self.theme != 0);
     }
 
     /// The picker's rows or highlight changed (typing, keys, wheel). Its row rectangles from the last frame no longer
@@ -866,7 +858,7 @@ impl Ui {
             "Stop" | "Notification" if !looking => {
                 p.attention = true;
                 if !self.focused {
-                    self.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+                    self.window.request_user_attention();
                 }
             }
             "SessionEnd" => {
@@ -1027,13 +1019,13 @@ impl Ui {
                 self.invalidate();
             }
             Action::Nop => {}
-            Action::Minimize => self.window.set_minimized(true),
+            Action::Minimize => self.window.set_minimized(),
             Action::ToggleMaximize => {
                 if self.maximized() {
-                    self.window.set_fullscreen(None);
+                    self.window.set_fullscreen(false);
                     self.window.set_maximized(false);
                 } else if self.text[5] == 0 {
-                    self.window.set_fullscreen(Some(Fullscreen::Borderless(None))); // the monitor the window is on
+                    self.window.set_fullscreen(true); // the monitor the window is on
                 } else {
                     self.window.set_maximized(true);
                 }
@@ -1503,7 +1495,6 @@ impl Ui {
         // applied as-is. A notched wheel sends whole steps, which glide.
         let (dy, fine) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (y * 3.0, x.fract() != 0.0 || y.fract() != 0.0), // dy in lines
-            MouseScrollDelta::PixelDelta(p) => (p.y as f32 / self.font.ch as f32, true),
         };
         if let Some(pk) = &mut self.picker {
             // the wheel moves the highlight, not the terminal behind. Distance adds up until it covers a row:
@@ -2520,28 +2511,59 @@ fn draw_suggest(cv: &mut Canvas, font: &Font, ui: &mut Font, s: &Suggest, th: &T
 struct App {
     stats: bool,
     last_stats: Instant,
-    proxy: EventLoopProxy<Ev>,
-    cfg: Option<Config>,
-    ui: Option<Ui>,
+    rx: std::sync::mpsc::Receiver<Ev>,
+    ui: Ui,
 }
 
-impl ApplicationHandler<Ev> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if let (None, Some(cfg)) = (&self.ui, self.cfg.take()) {
-            self.ui = Some(Ui::new(el, self.proxy.clone(), cfg));
+impl App {
+    fn handle(&mut self, ev: Event) -> Control {
+        let ui = &mut self.ui;
+        match ev {
+            Event::Close => ui.quit = true,
+            Event::Focused(f) => {
+                ui.focused = f;
+                if f {
+                    ui.panes[ui.focus].attention = false;
+                }
+                ui.invalidate();
+            }
+            Event::Resized => ui.relayout(),
+            Event::Redraw => ui.draw(),
+            Event::Modifiers(m) => ui.mods = m,
+            Event::Key(k) => ui.on_key(&k),
+            Event::CursorMoved(x, y) => ui.on_cursor(x, y),
+            Event::Mouse(button, state) => ui.on_mouse_button(button, state),
+            Event::Wheel(delta) => ui.on_wheel(delta),
+            Event::Wake => {
+                while let Ok(ev) = self.rx.try_recv() {
+                    match ev {
+                        Ev::Output(id, bytes) => ui.on_output(id, &bytes),
+                        Ev::Exit(id) => {
+                            if let Some(i) = ui.panes.iter().position(|p| p.id == id) {
+                                ui.begin_close(i);
+                            }
+                        }
+                        Ev::Hook(h) => ui.on_hook(h),
+                    }
+                }
+            }
+            Event::AboutToWait => return self.about_to_wait(),
         }
+        if self.ui.quit {
+            self.ui.finish_memory();
+            return Control::Exit;
+        }
+        Control::Wait
     }
 
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        el.set_control_flow(ControlFlow::Wait);
+    fn about_to_wait(&mut self) -> Control {
         if self.stats && self.last_stats.elapsed() >= Duration::from_secs(1) {
             self.last_stats = Instant::now();
-            let animating = self.ui.as_ref().is_some_and(|u| u.animating);
-            eprintln!("stats: {} draws, {} output chunks, animating={animating}", DRAWS.swap(0, Ordering::Relaxed), OUTPUTS.swap(0, Ordering::Relaxed));
+            eprintln!("stats: {} draws, {} output chunks, animating={}", DRAWS.swap(0, Ordering::Relaxed), OUTPUTS.swap(0, Ordering::Relaxed), self.ui.animating);
         }
-        let Some(ui) = &mut self.ui else { return };
+        let ui = &mut self.ui;
         if ui.animating {
-            // Pace animation frames with a precise sleep: `WaitUntil` is rounded to the ~15.6 ms Windows timer
+            // Pace animation frames with a precise sleep: a timed wait is rounded to the ~15.6 ms Windows timer
             // tick, which makes frame intervals uneven and the animation look stuttery.
             let now = Instant::now();
             if now < ui.next_frame {
@@ -2558,51 +2580,9 @@ impl ApplicationHandler<Ev> for App {
                 ui.next_mark = now + Duration::from_secs_f32(1.0 / MARK_FPS);
                 ui.invalidate_rect(r);
             }
-            el.set_control_flow(ControlFlow::WaitUntil(ui.next_mark));
+            return Control::WaitUntil(ui.next_mark);
         }
-    }
-
-    fn user_event(&mut self, el: &ActiveEventLoop, ev: Ev) {
-        let Some(ui) = &mut self.ui else { return };
-        match ev {
-            Ev::Output(id, bytes) => ui.on_output(id, &bytes),
-            Ev::Exit(id) => {
-                if let Some(i) = ui.panes.iter().position(|p| p.id == id) {
-                    ui.begin_close(i);
-                }
-            }
-            Ev::Hook(h) => ui.on_hook(h),
-        }
-        if ui.quit {
-            ui.finish_memory();
-            el.exit();
-        }
-    }
-
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
-        let Some(ui) = &mut self.ui else { return };
-        match ev {
-            WindowEvent::CloseRequested => ui.quit = true,
-            WindowEvent::Focused(f) => {
-                ui.focused = f;
-                if f {
-                    ui.panes[ui.focus].attention = false;
-                }
-                ui.invalidate();
-            }
-            WindowEvent::Resized(PhysicalSize { width, height }) if width > 0 && height > 0 => ui.relayout(),
-            WindowEvent::RedrawRequested => ui.draw(),
-            WindowEvent::ModifiersChanged(m) => ui.mods = m.state(),
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => ui.on_key(&event),
-            WindowEvent::CursorMoved { position, .. } => ui.on_cursor(position.x as i32, position.y as i32),
-            WindowEvent::MouseInput { state, button, .. } => ui.on_mouse_button(button, state),
-            WindowEvent::MouseWheel { delta, .. } => ui.on_wheel(delta),
-            _ => {}
-        }
-        if ui.quit {
-            ui.finish_memory();
-            el.exit();
-        }
+        Control::Wait
     }
 }
 
@@ -2610,9 +2590,12 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("hook") {
         return claude::hook_main(); // run by Claude Code, see claude.rs
     }
-    let el = EventLoop::<Ev>::with_user_event().build().unwrap();
-    let mut app = App { stats: std::env::var_os("MAULA_STATS").is_some(), last_stats: Instant::now(), proxy: el.create_proxy(), cfg: Some(config::load()), ui: None };
-    el.run_app(&mut app).unwrap();
+    let cfg = config::load();
+    let (window, waker) = Window::new("maula", 1280.0, 800.0, 480.0, 300.0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ui = Ui::new(window, Proxy { tx, waker }, cfg);
+    let mut app = App { stats: std::env::var_os("MAULA_STATS").is_some(), last_stats: Instant::now(), rx, ui };
+    window::run(move |ev| app.handle(ev));
 }
 
 /// Dev tool, not part of the app: renders the real header + dropdown (the same functions the app calls) in both
