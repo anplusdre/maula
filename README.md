@@ -36,7 +36,7 @@ Every space is a tab. You can rename it, save it, load a saved one, or close bot
 
 ### Header dropdown
 
-The dropdown sets theme, view, font size, line height and letter spacing, and installs the Claude hooks. Every choice is saved to `config.toml`.
+The dropdown sets the theme and its accent colour, the view, what maximize does (borderless fullscreen by default, or a normal maximized window), font size, line height and letter spacing, and installs the Claude hooks. Every choice is saved to `config.toml`.
 
 ![Header dropdown](docs/menu.png)
 
@@ -50,8 +50,19 @@ The dropdown sets theme, view, font size, line height and letter spacing, and in
 - The panel header shows the drive and folder, each with a picker to jump elsewhere.
 - Typing `cd` plus three or more characters suggests matching sub-folders.
 - Ctrl+click opens links in the browser and `path:line:col` in your editor (`editor = "code -g"`).
-- Ctrl+Shift+F searches the scrollback.
 - Ctrl+C copies while text is selected; otherwise it sends ^C.
+
+### Keyboard shortcuts
+
+| Keys | Action |
+|---|---|
+| Ctrl+Shift+N | New terminal |
+| Ctrl+Shift+W | Close the focused terminal |
+| Ctrl+Tab | Focus the next terminal (in Space view, within the space) |
+| Ctrl+Shift+Tab | Switch to the next space |
+| Ctrl+Shift+G | Cycle the view: Space, Grid, Carousel |
+| Ctrl+Shift+F | Search the scrollback |
+| Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste (Ctrl+V pastes too) |
 
 ## Install
 
@@ -75,6 +86,8 @@ The config lives in `%APPDATA%\maula\config.toml` and is created with comments t
 ```toml
 theme = "dark"        # light | dark | friendly
 view = "space"        # space | grid | carousel
+accent = "default"    # default | terracotta | blue | teal | violet | rose
+maximize = "fullscreen" # fullscreen (borderless) | window
 # shell = "C:/Program Files/Git/bin/bash.exe"
 # editor = "code -g"
 # theme_colors = true # recolour programs (Claude Code included) to the theme palette
