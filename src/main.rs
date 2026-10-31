@@ -1811,6 +1811,9 @@ fn draw_term(cv: &mut Canvas, font: &mut Font, t: &Term, scroll_pos: f32, sel: O
             let cell = line.get(col).copied().unwrap_or(BLANK);
             let x = r.x + col as i32 * font.cw;
             let (mut fg, mut bg) = (mix(th.rgb(cell.fg), th.bg, 0.6 * dim), th.rgb(cell.bg));
+            if cell.dim {
+                fg = mix(fg, bg, 0.5);
+            }
             if let Some((a, b)) = sel {
                 if (abs, col) >= a && (abs, col) <= b {
                     bg = th.selection;
