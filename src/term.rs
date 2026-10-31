@@ -266,13 +266,40 @@ impl Term {
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
         let last = self.total_lines() - 1;
         let mut out = Vec::new();
+        let mut split = false; // the previous row was a word the program split: drop this row's indent
         for l in a.0.min(last)..=b.0.min(last) {
             let (s, e) = (if l == a.0 { a.1 } else { 0 }, if l == b.0 { b.1 } else { usize::MAX });
-            let text: String = self.line(l).iter().enumerate().filter(|(i, c)| *i >= s && *i <= e && c.ch != ' ').map(|(_, c)| c.ch).collect();
-            out.push(text.trim_end().to_string());
+            let text: String = self.line(l).iter().enumerate().filter(|(i, c)| *i >= s && *i <= e && c.ch != '\0').map(|(_, c)| c.ch).collect();
+            let text = if split { text.trim_start().to_string() } else { text };
+            let joins = l < b.0.min(last) && self.joins(l);
+            split = joins && !self.wraps(l);
+            out.push(if joins { text } else { text.trim_end().to_string() + "\n" });
         }
-        out.join("
-")
+        let mut out = out.concat();
+        out.pop(); // the last line's newline
+        out
+    }
+
+    /// Copying line `l` should run straight on into the next one: it wrapped at the edge, or the program broke a
+    /// word too long for its width onto the next row itself (Claude Code does this to long paths, indenting the rest).
+    /// ponytail: a full row ending in a token too long to have fit whole means a split word; other full rows keep their newline.
+    fn joins(&self, l: usize) -> bool {
+        if self.wraps(l) {
+            return true;
+        }
+        if l + 1 >= self.total_lines() {
+            return false;
+        }
+        let text = |l: usize| self.line(l).iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect::<String>();
+        let (a, b) = (text(l), text(l + 1));
+        let (a, end) = (a.trim_end(), trimmed_len(self.line(l)));
+        let indent = b.chars().take_while(|c| *c == ' ').count();
+        if end + 2 < self.cols || b.trim().is_empty() || indent == 0 || end <= indent {
+            return false;
+        }
+        let last = a.rsplit(' ').next().unwrap_or("").chars().count();
+        let first = b.trim_start().split(' ').next().unwrap_or("").chars().count();
+        last > 0 && last + first > end - indent
     }
 
     /// Whether line `idx` (absolute) runs on into the next one.
@@ -760,6 +787,13 @@ mod tests {
     }
 
     #[test]
+    fn copy_joins_a_path_the_program_split_but_not_word_wrapped_prose() {
+        let mut t = Term::new(12, 4);
+        t.feed(b"  D:\\work\\en\r\n  gine\\x .\r\n  hello you\r\n  there");
+        assert_eq!(t.text_range((0, 0), (3, 11)), "  D:\\work\\engine\\x .\n  hello you\n  there");
+    }
+
+    #[test]
     fn faint_text_is_marked_dim() {
         let mut t = Term::new(10, 1);
         t.feed(b"a[2mb[22mc[2md[0me");
@@ -912,7 +946,7 @@ mod tests {
         t.resize(8, 2);
         assert_eq!((t.history.len(), t.dump().as_str()), (0, "abcdefgh\nxy"));
         t.resize(2, 2); // narrower than before: pieces go back into history, the cursor's line stays on screen
-        assert_eq!(t.text_range((0, 0), (t.total_lines() - 1, 9)), "ab\ncd\nef\ngh\nxy");
+        assert_eq!(t.text_range((0, 0), (t.total_lines() - 1, 9)), "abcdefgh\nxy"); // wrapped pieces copy as one line
         assert_eq!((t.cx, t.cy, t.line(t.history.len() + t.cy)[0].ch), (1, 1, 'x'));
 
         let mut t = Term::new(6, 2); // a wide char is never cut in half
