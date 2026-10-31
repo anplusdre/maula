@@ -20,9 +20,10 @@ pub struct Cell {
     pub ch: char, // '\0' = right half of a wide char
     pub fg: Color,
     pub bg: Color,
+    pub dim: bool, // SGR 2: faint text, e.g. Claude Code's tab-completion suggestion
 }
 
-pub const BLANK: Cell = Cell { ch: ' ', fg: Color::Fg, bg: Color::Bg };
+pub const BLANK: Cell = Cell { ch: ' ', fg: Color::Fg, bg: Color::Bg, dim: false };
 
 /// A history line. `wrapped`: it ran into the right edge and continues on the next line (it is full width then);
 /// otherwise it ended with a newline and its trailing blanks are dropped.
@@ -64,6 +65,7 @@ pub struct Term {
     fg: Color,
     bg: Color,
     reverse: bool,
+    dim: bool,
     wrap_pending: bool,
     saved: (usize, usize),
     top: usize,
@@ -219,6 +221,7 @@ impl Term {
             fg: Color::Fg,
             bg: Color::Bg,
             reverse: false,
+            dim: false,
             wrap_pending: false,
             saved: (0, 0),
             top: 0,
@@ -265,10 +268,11 @@ impl Term {
         let mut out = Vec::new();
         for l in a.0.min(last)..=b.0.min(last) {
             let (s, e) = (if l == a.0 { a.1 } else { 0 }, if l == b.0 { b.1 } else { usize::MAX });
-            let text: String = self.line(l).iter().enumerate().filter(|(i, c)| *i >= s && *i <= e && c.ch != '\0').map(|(_, c)| c.ch).collect();
+            let text: String = self.line(l).iter().enumerate().filter(|(i, c)| *i >= s && *i <= e && c.ch != ' ').map(|(_, c)| c.ch).collect();
             out.push(text.trim_end().to_string());
         }
-        out.join("\n")
+        out.join("
+")
     }
 
     /// Whether line `idx` (absolute) runs on into the next one.
@@ -527,9 +531,9 @@ impl Term {
         }
         let (fg, bg) = if self.reverse { (self.bg, self.fg) } else { (self.fg, self.bg) };
         let i = self.cy * self.cols + self.cx;
-        self.cells[i] = Cell { ch, fg, bg };
+        self.cells[i] = Cell { ch, fg, bg, dim: self.dim };
         if w == 2 {
-            self.cells[i + 1] = Cell { ch: '\0', fg, bg };
+            self.cells[i + 1] = Cell { ch: '\0', fg, bg, dim: self.dim };
         }
         self.cx += w;
         if self.cx >= self.cols {
@@ -561,7 +565,7 @@ impl Term {
 
     /// Erase cells [from, to) using the current background color.
     fn fill(&mut self, from: usize, to: usize) {
-        let blank = Cell { ch: ' ', fg: Color::Fg, bg: self.bg };
+        let blank = Cell { ch: ' ', fg: Color::Fg, bg: self.bg, dim: false };
         self.cells[from..to].fill(blank);
         let c = self.cols;
         if from < to {
@@ -706,7 +710,9 @@ impl Term {
         let mut i = 0;
         while i < p.len() {
             match p[i] {
-                0 => (self.fg, self.bg, self.reverse) = (Color::Fg, Color::Bg, false),
+                0 => (self.fg, self.bg, self.reverse, self.dim) = (Color::Fg, Color::Bg, false, false),
+                2 => self.dim = true,
+                22 => self.dim = false,
                 7 => self.reverse = true,
                 27 => self.reverse = false,
                 30..=37 => self.fg = Color::Ansi((p[i] - 30) as u8),
@@ -751,6 +757,14 @@ mod tests {
             let rows: Vec<String> = self.cells.chunks(self.cols).map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string()).collect();
             rows.join("\n")
         }
+    }
+
+    #[test]
+    fn faint_text_is_marked_dim() {
+        let mut t = Term::new(10, 1);
+        t.feed(b"a[2mb[22mc[2md[0me");
+        let dims: Vec<bool> = t.cells[..5].iter().map(|c| c.dim).collect();
+        assert_eq!(dims, [false, true, false, true, false]);
     }
 
     #[test]
