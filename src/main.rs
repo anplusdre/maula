@@ -2745,7 +2745,7 @@ mod header_preview {
     fn render(th: Theme, theme: usize, menu: bool, sel: Option<usize>, mouse: (i32, i32), scale: f32) -> (i32, i32, Vec<u32>) {
         let (mut ui, mut icons) = (Font::new(UI_PX * scale), Font::icons(ICON * scale));
         let hh = px(HEADER, scale);
-        let (w, h) = ((1100.0 * scale) as i32, hh + px(if menu { 480.0 } else { 24.0 }, scale));
+        let (w, h) = ((1100.0 * scale) as i32, hh + px(if menu { 600.0 } else { 24.0 }, scale));
         let mut buf = vec![th.bg; (w * h) as usize]; // below the header: the terminal surface, to show the active tab joining it
         let none = HashMap::new();
         let mut chrome = Chrome { th, scale, w, fades: &none, view: View::Grid, theme, menu_open: menu, menu_sel: sel, maximized: false, can_add: true, hooks: false };
@@ -2757,7 +2757,7 @@ mod header_preview {
         hits.clear();
         draw_header(&mut cv, &mut icons, &chrome, &mut hits);
         if menu {
-            draw_menu(&mut cv, &mut ui, &mut icons, &chrome, TEXT_DEFAULT, Some((1, Some(3))), &mut hits);
+            draw_menu(&mut cv, &mut ui, &mut icons, &chrome, TEXT_DEFAULT, Some((4, Some(2))), &mut hits); // the Accent submenu open
         }
         (w, h, buf)
     }
@@ -2770,7 +2770,7 @@ mod header_preview {
         let (mut all, mut total_h, mut width) = (Vec::new(), 0, 0);
         for (theme, th) in [Theme::light(), Theme::dark(), Theme::friendly()].into_iter().enumerate() {
             // closed, a tab hovered, dropdown open with a row highlighted
-            for (menu, sel, mouse) in [(false, None, (-1, -1)), (false, None, (px(230.0, scale), 6)), (true, Some(2), (40, 150))] {
+            for (menu, sel, mouse) in [(false, None, (-1, -1)), (false, None, (px(230.0, scale), 6)), (true, Some(3), (40, 150))] {
                 let (w, h, b) = render(th, theme, menu, sel, mouse, scale);
                 all.extend(b);
                 all.extend(vec![0x808080; (w * 6) as usize]); // divider between states
