@@ -1,0 +1,92 @@
+# maula
+
+A terminal workspace for [Claude Code](https://claude.com/claude-code). It runs several terminals side by side in one native window, keeps a memory of each Claude session, and tells you which panel is waiting on you.
+
+Written in Rust and drawn in software (winit + softbuffer + fontdue), so there is no web view and no GPU requirement. It's built for Windows and runs PowerShell or Git Bash.
+
+![Space view, light theme](docs/light.png)
+
+## Features
+
+### Three themes
+
+Light, Dark and Friendly (a soft grey between the two). Pick one from the header dropdown or in `config.toml`.
+
+| Dark | Friendly |
+|---|---|
+| ![Dark theme](docs/dark.png) | ![Friendly theme](docs/friendly.png) |
+
+Claude Code keeps its own colours by default. To have programs' exact RGB colours drawn in the nearest colour of the maula theme, set `theme_colors = true` (optional, off by default).
+
+### Three views
+
+- **Space**: tabs of two terminals each (the screenshots above).
+- **Grid**: pages of 2×2 terminals.
+- **Carousel**: a row of cards that you scroll through, with the focused one in the middle.
+
+| Grid | Carousel |
+|---|---|
+| ![Grid view](docs/grid.png) | ![Carousel view](docs/carousel.png) |
+
+### Spaces
+
+Every space is a tab. You can rename it, save it, load a saved one, or close both of its terminals. A dot on a tab means a Claude session in that space is waiting for you.
+
+![Space tabs and the Save / Load menu](docs/spaces.png)
+
+### Header dropdown
+
+The dropdown sets theme, view, font size, line height and letter spacing, and installs the Claude hooks. Every choice is saved to `config.toml`.
+
+![Header dropdown](docs/menu.png)
+
+### Claude Code integration
+
+- **Install hooks** (dropdown → Claude) adds maula's hooks to every Claude account's `settings.json`, and keeps a backup as `settings.json.maula-bak`. maula then knows which session runs in which panel and when Claude stops or asks something.
+- **MEMORY** (panel header): while it's on, a summary of the session (what you needed, the decisions made, open items) is saved to `.maula/memory` in the project, so a later session or another account can pick it up.
+
+### Terminal niceties
+
+- The panel header shows the drive and folder, each with a picker to jump elsewhere.
+- Typing `cd` plus three or more characters suggests matching sub-folders.
+- Ctrl+click opens links in the browser and `path:line:col` in your editor (`editor = "code -g"`).
+- Ctrl+Shift+F searches the scrollback.
+- Ctrl+C copies while text is selected; otherwise it sends ^C.
+
+## Install
+
+Build it with Rust 1.85+ (edition 2024):
+
+```sh
+cargo build --release
+# target/release/maula.exe
+```
+
+The installer is per user and needs no admin rights. To build it, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run:
+
+```sh
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\maula.iss
+```
+
+## Configuration
+
+The config lives in `%APPDATA%\maula\config.toml` and is created with comments the first time maula runs. A minimal example:
+
+```toml
+theme = "dark"        # light | dark | friendly
+view = "space"        # space | grid | carousel
+# shell = "C:/Program Files/Git/bin/bash.exe"
+# editor = "code -g"
+# theme_colors = true # recolour programs (Claude Code included) to the theme palette
+
+[[panel]]
+name = "api"
+dir = "D:/work/api"
+cmd = "claude"
+```
+
+Each theme's colours can be overridden under `[light]`, `[dark]` or `[friendly]`. Each panel can override them with its own `bg` and `accent`.
+
+## License
+
+[MIT](LICENSE). Bundles JetBrains Mono ([OFL](assets/JetBrainsMono-OFL.txt)) and a subset of Lucide icons ([ISC](assets/Lucide-LICENSE.txt)).
