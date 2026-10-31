@@ -3,18 +3,19 @@
 mod claude;
 mod config;
 mod gfx;
+mod json;
 mod link;
 mod picker;
 mod suggest;
 mod term;
+mod width;
+mod win;
 
 use config::{Config, PanelCfg, SavedSpace, Theme, THEME_NAMES};
 use gfx::{blend, Canvas, Font, Rect};
 use picker::{Kind, Picker};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::{
     io::{Read, Write},
-    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -26,6 +27,7 @@ use winit::{
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
+    raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{CursorIcon, Fullscreen, ResizeDirection, Theme as WinTheme, Window, WindowId},
 };
 use std::{
@@ -187,8 +189,8 @@ struct Pane {
     fg: Option<u32>,
     accent: Option<u32>,
     term: Term,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    master: win::Pty,
+    writer: std::fs::File,
     scroll_pos: f32,    // displayed scroll position, in lines back; chases scroll_goal
     scroll_goal: f32,   // where scrolling is heading, in fractional lines (term.scroll is this, rounded)
     vis: Tween,         // 0..1 visibility: fades in when created, out when closing
@@ -210,45 +212,29 @@ impl Pane {
     }
 }
 
-fn shell_command(shell: Option<&str>, dir: Option<&Path>) -> CommandBuilder {
-    let mut cmd;
-    if cfg!(windows) {
-        let exe = shell.unwrap_or("powershell.exe");
-        cmd = CommandBuilder::new(exe);
-        let l = exe.to_lowercase();
-        if l.contains("powershell") || l.contains("pwsh") {
-            cmd.args(["-NoLogo", "-NoExit", "-Command", PS_HOOK]);
-        } else if l.contains("bash") {
-            // Git Bash: `pwd -W` is the folder as Windows writes it (D:/x), which the header and pickers understand
-            cmd.env("PROMPT_COMMAND", format!(r#"printf '\033]9;9;"%s"\007' "$(pwd -W 2>/dev/null || pwd)"; {BASH_PS1}"#));
-        }
-    } else {
-        // ponytail: bash (here and Git Bash above) reports its cwd and swaps its prompt for the mark via PROMPT_COMMAND (a bashrc that overwrites it disables both); zsh/fish not hooked yet.
-        let sh = shell.map(String::from).or_else(|| std::env::var("SHELL").ok()).unwrap_or("sh".into());
-        cmd = CommandBuilder::new(sh);
-        cmd.env("PROMPT_COMMAND", format!(r#"printf '\033]7;file://%s%s\007' "$HOSTNAME" "$PWD"; {BASH_PS1}"#));
+/// The shell to start: program, arguments, and the variables it gets on top of maula's environment.
+fn shell_command(shell: Option<&str>) -> (String, Vec<&'static str>, Vec<(&'static str, String)>) {
+    let exe = shell.unwrap_or("powershell.exe");
+    let l = exe.to_lowercase();
+    let mut env = vec![("TERM", "xterm-256color".to_string()), ("COLORTERM", "truecolor".to_string())];
+    let mut args = Vec::new();
+    if l.contains("powershell") || l.contains("pwsh") {
+        args = vec!["-NoLogo", "-NoExit", "-Command", PS_HOOK];
+    } else if l.contains("bash") {
+        // Git Bash: `pwd -W` is the folder as Windows writes it (D:/x), which the header and pickers understand
+        // ponytail: a bashrc that overwrites PROMPT_COMMAND disables the cwd report and the prompt mark
+        env.push(("PROMPT_COMMAND", format!(r#"printf '\033]9;9;"%s"\007' "$(pwd -W 2>/dev/null || pwd)"; {BASH_PS1}"#)));
     }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    if let Some(d) = dir {
-        cmd.cwd(d);
-    }
-    cmd
+    (exe.to_string(), args, env)
 }
 
 /// `ipc`: the hook listener's (port, token), handed to the shell so `maula hook` can report back to this panel.
-fn spawn_pty(proxy: &EventLoopProxy<Ev>, id: usize, shell: Option<&str>, dir: Option<&Path>, ipc: Option<&(u16, String)>) -> (Box<dyn MasterPty + Send>, Box<dyn Write + Send>) {
-    let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).expect("openpty");
-    let mut cmd = shell_command(shell, dir);
+fn spawn_pty(proxy: &EventLoopProxy<Ev>, id: usize, shell: Option<&str>, dir: Option<&Path>, ipc: Option<&(u16, String)>) -> (win::Pty, std::fs::File) {
+    let (exe, args, mut env) = shell_command(shell);
     if let Some((port, token)) = ipc {
-        cmd.env("MAULA_PANE", id.to_string());
-        cmd.env("MAULA_PORT", port.to_string());
-        cmd.env("MAULA_TOKEN", token);
+        env.extend([("MAULA_PANE", id.to_string()), ("MAULA_PORT", port.to_string()), ("MAULA_TOKEN", token.clone())]);
     }
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn shell");
-    drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let writer = pair.master.take_writer().unwrap();
+    let (pty, mut reader, writer, child) = win::spawn(&exe, &args, &env, dir, 80, 24).expect("spawn shell");
 
     let p = proxy.clone();
     std::thread::spawn(move || {
@@ -259,13 +245,13 @@ fn spawn_pty(proxy: &EventLoopProxy<Ev>, id: usize, shell: Option<&str>, dir: Op
             }
         }
     });
-    // Windows ConPTY never gives the reader EOF when the child exits, so watch the child itself.
+    // ConPTY never gives the reader EOF when the child exits, so watch the child itself.
     let p = proxy.clone();
     std::thread::spawn(move || {
-        let _ = child.wait();
+        child.wait();
         let _ = p.send_event(Ev::Exit(id));
     });
-    (pair.master, writer)
+    (pty, writer)
 }
 
 /// ponytail: no F-keys, no kitty keyboard protocol. Add when something needs them.
@@ -328,7 +314,7 @@ fn title(p: &Pane) -> String {
 
 struct Ui {
     window: Arc<Window>,
-    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    hwnd: isize, // the window, for presenting frames and owning the clipboard
     font: Font,    // terminal (monospace)
     ui_font: Font, // dropdown, popups
     title_font: Font, // panel titles
@@ -384,7 +370,6 @@ struct Ui {
     next_frame: Instant,                // frame pacing while animating
     close_font: Font,                   // "CLOSE" in panel headers
     icon: CursorIcon,
-    clipboard: Option<arboard::Clipboard>,
     quit: bool,
 }
 
@@ -407,13 +392,15 @@ impl Ui {
         let text = text_of(&cfg);
         let ((font, title_font), ui_font) = (text_fonts(text, scale), Font::new(UI_PX * scale));
         let (icon_font, close_font) = (Font::icons(ICON * scale), Font::medium(CLOSE_PX * scale));
-        let context = softbuffer::Context::new(window.clone()).unwrap();
-        let surface = softbuffer::Surface::new(&context, window.clone()).unwrap();
+        let hwnd = match window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+            _ => panic!("not a Win32 window"),
+        };
         let p = proxy.clone();
         let ipc = claude::listen(move |h| drop(p.send_event(Ev::Hook(h))));
         let mut ui = Ui {
             window,
-            surface,
+            hwnd,
             font,
             ui_font,
             title_font,
@@ -473,7 +460,6 @@ impl Ui {
             next_frame: Instant::now(),
             close_font,
             icon: CursorIcon::Default,
-            clipboard: arboard::Clipboard::new().ok(),
             quit: false,
         };
         ui.sync_window_theme();
@@ -632,7 +618,7 @@ impl Ui {
             if (cols, rows) != (p.term.cols, p.term.rows) {
                 p.term.resize(cols, rows);
                 p.sel = None; // its line numbers point at the old wrapping
-                let _ = p.master.resize(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 });
+                p.master.resize(cols, rows);
             }
         }
         self.invalidate();
@@ -1100,7 +1086,7 @@ impl Ui {
     }
 
     fn paste(&mut self) {
-        if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+        if let Some(text) = win::clipboard_get(self.hwnd) {
             self.paste_text(&text);
         }
     }
@@ -1109,9 +1095,7 @@ impl Ui {
         let p = &mut self.panes[self.focus];
         let Some((a, b)) = p.sel.take() else { return };
         let text = p.term.text_range(a, b);
-        if let Some(c) = &mut self.clipboard {
-            let _ = c.set_text(text);
-        }
+        win::clipboard_set(self.hwnd, &text);
         self.invalidate();
     }
 
@@ -1627,7 +1611,9 @@ impl Ui {
         DRAWS.fetch_add(1, Ordering::Relaxed);
         self.tick();
         let size = self.window.inner_size();
-        let (Some(nw), Some(nh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
         let (w, h) = (size.width as i32, size.height as i32);
         let slots = self.slots();
         let (hh, maximized, scale) = (self.toolbar_h(), self.maximized(), self.scale);
@@ -1648,7 +1634,7 @@ impl Ui {
         let tab_menu = self.smenu.map(|id| (id, self.smenu_sel, self.space_count(id)));
         let (hooks, focused, clock) = (self.hooks, self.focused, self.started.elapsed().as_secs_f32());
         let mut mark = None; // the live prompt mark's cell, if one is on screen
-        let Ui { surface, frame, font, ui_font: ui, title_font: titlef, close_font: closef, icon_font: icons, panes, hits, focus, view, menu_open, menu_sel, sub, sub_sel, text, picker, fades, themes, theme, spaces, rename, search, .. } = self;
+        let Ui { hwnd, frame, font, ui_font: ui, title_font: titlef, close_font: closef, icon_font: icons, panes, hits, focus, view, menu_open, menu_sel, sub, sub_sel, text, picker, fades, themes, theme, spaces, rename, search, .. } = self;
         let th = with_accent(themes[*theme], text[4]);
         let mut cv = Canvas::new(frame.as_mut_slice(), w, h);
         cv.set_bounds(area);
@@ -1769,16 +1755,8 @@ impl Ui {
                 cv.rect(r, th.border);
             }
         }
-        surface.resize(nw, nh).unwrap();
-        let mut buf = surface.buffer_mut().unwrap();
-        buf.copy_from_slice(frame);
-        let a = area.intersect(&Rect { x: 0, y: 0, w, h });
-        match (full, NonZeroU32::new(a.w as u32), NonZeroU32::new(a.h as u32)) {
-            (false, Some(width), Some(height)) => {
-                buf.present_with_damage(&[softbuffer::Rect { x: a.x as u32, y: a.y as u32, width, height }]).unwrap()
-            }
-            _ => buf.present().unwrap(),
-        }
+        let a = if full { Rect { x: 0, y: 0, w, h } } else { area.intersect(&Rect { x: 0, y: 0, w, h }) };
+        win::present(*hwnd, frame, w, (a.x, a.y, a.w, a.h));
         self.mark = mark;
         if again {
             self.invalidate();
@@ -1901,6 +1879,7 @@ fn chip(cv: &mut Canvas, titlef: &mut Font, icons: &mut Font, th: &Theme, scale:
 #[allow(clippy::too_many_arguments)]
 fn draw_panel_header(cv: &mut Canvas, titlef: &mut Font, closef: &mut Font, icons: &mut Font, th: &Theme, scale: f32, hr: Rect, index: usize, title: &str, drive: Option<char>, active: bool, memory: bool, attention: bool, fades: &HashMap<RectKey, Tween>) -> PanelHits {
     let (pad, track, dot) = (px(16.0, scale), titlef.track, px(6.0, scale));
+    let th = &Theme { head_bg: if active { th.head_bg } else { th.bg }, ..*th }; // inactive: blends into its terminal
     cv.rect(hr, th.head_bg);
     // a cell at the right end of the header, ending at `right`: hover tint, label, hairline on its left
     let mut cell = |label: &str, lead: i32, right: i32| {
@@ -2909,7 +2888,7 @@ mod header_preview {
 
     #[test]
     fn accent_and_maximize_come_from_the_config() {
-        let c: Config = toml::from_str("accent = \"Blue\"\nmaximize = \"window\"").unwrap();
+        let c = config::parse_config("accent = \"Blue\"\nmaximize = \"window\"").unwrap();
         assert_eq!(text_of(&c)[4..], [2, 1]);
         assert_eq!(text_of(&Config::default())[4..], [0, 0], "unset: the theme's own accent, borderless fullscreen");
         let t = with_accent(Theme::dark(), 2);

@@ -3,7 +3,7 @@
 //! panel and when Claude stops or asks something; maula then reads the new part of that session's transcript to keep
 //! the panel's memory: your prompts and Claude's explanations, nothing else.
 
-use serde_json::{json, Value};
+use crate::json::{self, Json};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -74,7 +74,7 @@ fn parse_hook(text: &str, token: &str) -> Option<Hook> {
     }
     let pane = it.next()?.trim().parse().ok()?;
     let config_dir = Some(it.next()?.trim().to_string()).filter(|d| !d.is_empty());
-    let v: Value = serde_json::from_str(it.next()?).ok()?;
+    let v = json::parse(it.next()?)?;
     let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
     Some(Hook { pane, event: s("hook_event_name"), session: s("session_id"), transcript: s("transcript_path").into(), cwd: s("cwd").into(), config_dir })
 }
@@ -180,14 +180,14 @@ fn claude_command() -> std::process::Command {
 /// The note in one transcript line: a prompt you typed, or the text of one of Claude's replies. Tool calls and
 /// results, thinking, subagents, slash commands and system messages are skipped.
 fn note(line: &str) -> Option<Note> {
-    let v: Value = serde_json::from_str(line).ok()?;
+    let v = json::parse(line)?;
     if v["isSidechain"].as_bool() == Some(true) || v["isMeta"].as_bool() == Some(true) {
         return None;
     }
     let content = &v["message"]["content"];
     let text = match (v["type"].as_str()?, content) {
-        ("user", Value::String(s)) => s.clone(),
-        (kind @ ("user" | "assistant"), Value::Array(parts)) => {
+        ("user", Json::Str(s)) => s.clone(),
+        (kind @ ("user" | "assistant"), Json::Arr(parts)) => {
             if parts.iter().any(|p| p["type"] == "tool_result") {
                 return None;
             }
@@ -214,7 +214,7 @@ fn hook_command() -> Option<String> {
 }
 
 /// A hook entry maula added (any build of it).
-fn is_ours(h: &Value) -> bool {
+fn is_ours(h: &Json) -> bool {
     h["command"].as_str().is_some_and(|c| c.contains("maula") && c.ends_with(" hook"))
 }
 
@@ -237,30 +237,31 @@ fn accounts() -> Vec<PathBuf> {
 }
 
 /// `settings` with maula's hooks for `EVENTS` running `cmd`, replacing any older maula entries; everything else kept.
-fn with_hooks(mut settings: Value, cmd: &str) -> Option<Value> {
-    let hooks = settings.as_object_mut()?.entry("hooks").or_insert(json!({})).as_object_mut()?;
+fn with_hooks(mut settings: Json, cmd: &str) -> Option<Json> {
+    let hooks = settings.entry("hooks", Json::Obj(vec![]))?;
+    let ours = Json::obj(&[("hooks", Json::Arr(vec![Json::obj(&[("type", Json::str("command")), ("command", Json::str(cmd))])]))]);
     for ev in EVENTS {
-        let groups = hooks.entry(ev).or_insert(json!([])).as_array_mut()?;
+        let Json::Arr(groups) = hooks.entry(ev, Json::Arr(vec![]))? else { return None };
         for g in groups.iter_mut() {
-            if let Some(list) = g["hooks"].as_array_mut() {
+            if let Some(Json::Arr(list)) = g.get_mut("hooks") {
                 list.retain(|h| !is_ours(h));
             }
         }
         groups.retain(|g| g["hooks"].as_array().is_none_or(|l| !l.is_empty()));
-        groups.push(json!({ "hooks": [{ "type": "command", "command": cmd }] }));
+        groups.push(ours.clone());
     }
     Some(settings)
 }
 
 /// Whether `settings` already runs `cmd` for every event.
-fn has_hooks(settings: &Value, cmd: &str) -> bool {
+fn has_hooks(settings: &Json, cmd: &str) -> bool {
     EVENTS.iter().all(|ev| settings["hooks"][ev].as_array().is_some_and(|gs| gs.iter().any(|g| g["hooks"].as_array().is_some_and(|l| l.iter().any(|h| h["command"] == cmd)))))
 }
 
-fn read_settings(path: &Path) -> Option<Value> {
+fn read_settings(path: &Path) -> Option<Json> {
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).ok(), // unreadable JSON: never overwrite it
-        Err(_) => Some(json!({})),
+        Ok(text) => json::parse(&text), // unreadable JSON: never overwrite it
+        Err(_) => Some(Json::Obj(vec![])),
     }
 }
 
@@ -282,7 +283,7 @@ pub fn install_hooks() {
         if path.exists() {
             let _ = std::fs::copy(&path, path.with_extension("json.maula-bak"));
         }
-        let text = serde_json::to_string_pretty(&new).unwrap_or_default();
+        let text = json::pretty(&new);
         if let Err(e) = std::fs::write(&path, text + "\n") {
             eprintln!("maula: cannot write {}: {e}", path.display());
         }
@@ -330,18 +331,18 @@ mod tests {
 
     #[test]
     fn hooks_are_added_once_and_keep_the_rest() {
-        let old = json!({ "model": "opus", "hooks": { "Stop": [{ "hooks": [
+        let old = json::parse(r#"{ "model": "opus", "hooks": { "Stop": [{ "hooks": [
             { "type": "command", "command": "\"D:/old/maula.exe\" hook" },
             { "type": "command", "command": "say done" }
-        ] }] } });
+        ] }] } }"#).unwrap();
         let cmd = "\"D:/new/maula.exe\" hook";
         let new = with_hooks(old, cmd).unwrap();
         assert!(has_hooks(&new, cmd));
         assert_eq!(new["model"], "opus", "other settings kept");
         let stop = new["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop[0]["hooks"], json!([{ "type": "command", "command": "say done" }]), "the old maula entry is replaced, other hooks stay");
+        assert_eq!(stop[0]["hooks"], json::parse(r#"[{ "type": "command", "command": "say done" }]"#).unwrap(), "the old maula entry is replaced, other hooks stay");
         assert_eq!(with_hooks(new.clone(), cmd).unwrap(), new, "installing again changes nothing");
-        assert!(!has_hooks(&json!({}), cmd));
+        assert!(!has_hooks(&Json::Obj(vec![]), cmd));
     }
 
     #[test]

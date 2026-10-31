@@ -2,7 +2,6 @@
 //! ponytail: every char is 1 or 2 cells (combining marks dropped), no mouse reporting.
 
 use std::collections::VecDeque;
-use unicode_width::UnicodeWidthChar;
 
 const HISTORY_MAX: usize = 10_000;
 
@@ -431,7 +430,14 @@ impl Term {
                     self.wrap_pending = false;
                 }
                 0x09 => self.cx = ((self.cx / 8 + 1) * 8).min(self.cols - 1),
-                0x0a..=0x0c => self.linefeed(),
+                0x0a..=0x0c => {
+                    self.linefeed();
+                    // ConPTY passes OSC 133;A through ahead of text it has not drawn yet (the echoed command and
+                    // its newline): a newline after the prompt mark is that stale text, so the prompt is below it
+                    if self.prompt.is_some() {
+                        self.prompt = Some((self.history.len() + self.cy, 0));
+                    }
+                }
                 0x0d => {
                     self.cx = 0;
                     self.wrap_pending = false;
@@ -546,9 +552,9 @@ impl Term {
     }
 
     fn put(&mut self, ch: char) {
-        let w = match ch.width() {
-            Some(0) | None => return, // ponytail: combining marks dropped
-            Some(w) => w.min(2).min(self.cols),
+        let w = match crate::width::width(ch) {
+            0 => return, // ponytail: combining marks dropped
+            w => w.min(self.cols),
         };
         if self.wrap_pending || self.cx + w > self.cols {
             self.wrapped[self.cy] = true;
@@ -897,8 +903,10 @@ mod tests {
         let mut t = Term::new(6, 3);
         t.feed(b"out\r\n\x1b]133;A\x07   abcdefgh"); // prompt on row 1, the typed text wraps
         assert!(t.prompt == Some((1, 0)) && t.at_prompt(), "the cursor is on the wrapped row of the prompt's line");
-        t.feed(b"\r\n\r\n"); // scrolls: the absolute line stays the same
-        assert!(t.prompt == Some((1, 0)) && !t.at_prompt(), "output moved on: no longer at the prompt");
+
+        let mut t = Term::new(10, 2);
+        t.feed(b"   \x1b]133;A\x07dir\r\nfile\r\n   "); // ConPTY: the marker came before the last command's echo and output
+        assert!(t.prompt == Some((2, 0)) && t.at_prompt(), "the prompt is on the line after them (scrolled)");
 
         let mut t = Term::new(6, 3);
         t.feed(b"\x1b]133;A\x07   abcdefgh"); // cursor on the wrapped second row
