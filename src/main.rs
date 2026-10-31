@@ -8,6 +8,7 @@ mod link;
 mod picker;
 mod suggest;
 mod term;
+mod ttf;
 mod width;
 mod win;
 

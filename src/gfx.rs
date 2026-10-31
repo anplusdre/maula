@@ -1,5 +1,6 @@
 //! CPU drawing: font with lazy fallbacks, a clipped pixel canvas.
 
+use crate::ttf::Face;
 use std::collections::HashMap;
 
 /// JetBrains Mono Regular (SIL OFL, see assets/). System fonts below are only a fallback.
@@ -9,12 +10,7 @@ const BUNDLED_MEDIUM: &[u8] = include_bytes!("../assets/JetBrainsMono-Medium.ttf
 /// Lucide icons used by the UI (chevron-down, plus, x, minus, square, copy, check), subsetted.
 const LUCIDE: &[u8] = include_bytes!("../assets/lucide-subset.ttf");
 
-const FONTS: &[&str] = &[
-    r"C:\Windows\Fonts\consola.ttf",
-    "/System/Library/Fonts/Menlo.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-];
+const FONTS: &[&str] = &[r"C:\Windows\Fonts\consola.ttf"];
 
 /// Tried in order, loaded only when a glyph is missing from the primary font.
 const FALLBACKS: &[&str] = &[
@@ -23,11 +19,6 @@ const FALLBACKS: &[&str] = &[
     r"C:\Windows\Fonts\malgun.ttf",
     r"C:\Windows\Fonts\YuGothM.ttc",
     r"C:\Windows\Fonts\seguiemj.ttf",
-    "/System/Library/Fonts/Apple Symbols.ttf",
-    "/System/Library/Fonts/PingFang.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -76,15 +67,15 @@ impl Glyph {
         (self.w, self.h)
     }
 
-    fn new(font: &fontdue::Font, c: char, px: f32) -> Glyph {
-        let (m, cov) = font.rasterize(c, px);
-        Glyph { xmin: m.xmin, ymin: m.ymin, w: m.width, h: m.height, adv: m.advance_width, cov }
+    fn new(font: &Face, c: char, px: f32) -> Glyph {
+        let b = font.rasterize(c, px);
+        Glyph { xmin: b.xmin, ymin: b.ymin, w: b.w, h: b.h, adv: b.adv, cov: b.cov }
     }
 }
 
 struct Fallback {
     path: &'static str,
-    font: Option<fontdue::Font>,
+    font: Option<Face>,
     tried: bool,
 }
 
@@ -93,34 +84,31 @@ pub struct Font {
     pub ch: i32,
     pub ascent: i32,
     pub track: f32, // letter-spacing set by `spaced`, already counted in `cw`
-    primary: fontdue::Font,
+    primary: Face,
     fallbacks: Vec<Fallback>,
     px: f32,
     cache: HashMap<char, Glyph>,
 }
 
-fn load(path: &str) -> Option<fontdue::Font> {
-    fontdue::Font::from_bytes(std::fs::read(path).ok()?, fontdue::FontSettings::default()).ok()
+fn load(path: &str) -> Option<Face> {
+    Face::parse(std::fs::read(path).ok()?)
 }
 
 impl Font {
     /// JetBrains Mono, bundled: used for the terminal and for all UI text.
     pub fn new(px: f32) -> Self {
-        let primary = fontdue::Font::from_bytes(BUNDLED, fontdue::FontSettings::default())
-            .ok()
-            .or_else(|| FONTS.iter().find_map(|p| load(p)))
-            .expect("no monospace font found");
+        let primary = Face::parse(BUNDLED).or_else(|| FONTS.iter().find_map(|p| load(p))).expect("no monospace font found");
         Self::with(primary, px)
     }
 
     /// JetBrains Mono Medium (weight 500): tab titles.
     pub fn medium(px: f32) -> Self {
-        Self::with(fontdue::Font::from_bytes(BUNDLED_MEDIUM, fontdue::FontSettings::default()).unwrap(), px)
+        Self::with(Face::parse(BUNDLED_MEDIUM).unwrap(), px)
     }
 
     /// Icon font: a 2 KB subset of Lucide (ISC license, see assets/).
     pub fn icons(px: f32) -> Self {
-        Self::with(fontdue::Font::from_bytes(LUCIDE, fontdue::FontSettings::default()).unwrap(), px)
+        Self::with(Face::parse(LUCIDE).unwrap(), px)
     }
 
     /// Width in pixels of `s` set in this font.
@@ -133,12 +121,12 @@ impl Font {
         s.chars().map(|c| self.glyph(c).adv + track).sum::<f32>().round() as i32
     }
 
-    fn with(primary: fontdue::Font, px: f32) -> Self {
-        let lm = primary.horizontal_line_metrics(px).unwrap();
+    fn with(primary: Face, px: f32) -> Self {
+        let (ascent, descent) = primary.line_metrics(px);
         Font {
-            cw: primary.metrics('M', px).advance_width.round() as i32,
-            ch: (lm.ascent - lm.descent).ceil() as i32,
-            ascent: lm.ascent.round() as i32,
+            cw: primary.advance(primary.glyph_index('M'), px).round() as i32,
+            ch: (ascent - descent).ceil() as i32,
+            ascent: ascent.round() as i32,
             track: 0.0,
             primary,
             fallbacks: FALLBACKS.iter().map(|&path| Fallback { path, font: None, tried: false }).collect(),
@@ -155,7 +143,7 @@ impl Font {
             self.ascent += (ch - self.ch) / 2;
             self.ch = ch;
         }
-        self.cw = (self.primary.metrics('M', self.px).advance_width + track).round() as i32;
+        self.cw = (self.primary.advance(self.primary.glyph_index('M'), self.px) + track).round() as i32;
         self.track = track;
         self
     }
@@ -170,14 +158,14 @@ impl Font {
 
     fn render(&mut self, c: char) -> Glyph {
         let px = self.px;
-        if self.primary.lookup_glyph_index(c) == 0 {
+        if self.primary.glyph_index(c) == 0 {
             for f in &mut self.fallbacks {
                 if !f.tried {
                     f.tried = true;
                     f.font = load(f.path);
                 }
                 if let Some(font) = &f.font {
-                    if font.lookup_glyph_index(c) != 0 {
+                    if font.glyph_index(c) != 0 {
                         return Glyph::new(font, c, px);
                     }
                 }
