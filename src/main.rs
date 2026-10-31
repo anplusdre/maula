@@ -26,7 +26,7 @@ use winit::{
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
-    window::{CursorIcon, ResizeDirection, Theme as WinTheme, Window, WindowId},
+    window::{CursorIcon, Fullscreen, ResizeDirection, Theme as WinTheme, Window, WindowId},
 };
 use std::{
     collections::HashMap,
@@ -43,28 +43,34 @@ const RADIUS: i32 = 0; // the whole UI is square; raise this to round the dropdo
 const MAX_SPACES: usize = 5; // tabs that fit the header
 const SPACE_SIZE: usize = 2; // terminals per space
 
-/// Dropdown rows, in order: the themes (`THEME_NAMES` order), then view (space, grid, carousel), then the Text
-/// submenus (`TEXT_ROWS` order), then Claude.
-const MENU_ACTIONS: [Action; 11] = [
+/// Dropdown rows, in order: the themes (`THEME_NAMES` order) and Accent, then view (space, grid, carousel) and
+/// Maximize, then the Text submenus (`TEXT_ROWS` order), then Claude. `MENU_GROUPS`: how many rows each group has.
+const MENU_ACTIONS: [Action; 13] = [
     Action::SetTheme(0),
     Action::SetTheme(1),
     Action::SetTheme(2),
+    Action::SubMenu(4),
     Action::SetView(View::Space),
     Action::SetView(View::Grid),
     Action::SetView(View::Cards),
+    Action::SubMenu(5),
     Action::SubMenu(0),
     Action::SubMenu(1),
     Action::SubMenu(2),
     Action::SubMenu(3),
     Action::InstallHooks,
 ];
+const MENU_GROUPS: [(&str, usize); 4] = [("Theme", 4), ("View", 4), ("Text", 4), ("Claude", 1)];
 
-/// The Text group: each row opens a submenu of choices. Applies to the terminal and the header titles.
-const TEXT_ROWS: [&str; 4] = ["Font", "Size", "Line height", "Letter spacing"];
+/// The dropdown's submenu rows. The Text group (the first four) applies to the terminal and the header titles;
+/// Accent sits in the Theme group, Maximize in the View group.
+const TEXT_ROWS: [&str; 6] = ["Font", "Size", "Line height", "Letter spacing", "Accent", "Maximize"];
 const SIZES: [f32; 6] = [85.0, 90.0, 100.0, 110.0, 125.0, 150.0]; // percent of FONT_PX / TITLE_PX
 const LINES: [f32; 5] = [0.0, 1.2, 1.4, 1.6, 1.8]; // terminal row height, times the font size; 0 = the font's own (~1.32)
 const TRACKS: [f32; 5] = [0.0, 0.5, 1.0, 1.5, 2.0]; // letter-spacing, design px
-const TEXT_DEFAULT: [usize; 4] = [0, 2, 0, 0]; // chosen index per TEXT_ROWS entry
+const ACCENTS: [(&str, u32); 6] = [("Default", 0), ("Terracotta", 0xd97757), ("Blue", 0x4f86d9), ("Teal", 0x2a9d8f), ("Violet", 0x8b6fd6), ("Rose", 0xd9577f)];
+const MAXIMIZE: [&str; 2] = ["Borderless fullscreen", "Maximized window"]; // saved as "fullscreen" / "window"
+const TEXT_DEFAULT: [usize; 6] = [0, 2, 0, 0, 0, 0]; // chosen index per TEXT_ROWS entry
 
 /// Labels of the choices in Text submenu `k`.
 fn text_choices(k: usize) -> Vec<String> {
@@ -72,18 +78,32 @@ fn text_choices(k: usize) -> Vec<String> {
         0 => vec!["JetBrains Mono".into()],
         1 => SIZES.iter().map(|s| format!("{s}%")).collect(),
         2 => LINES.iter().map(|&l| if l == 0.0 { "Default".into() } else { format!("{l}") }).collect(),
+        4 => ACCENTS.iter().map(|a| a.0.into()).collect(),
+        5 => MAXIMIZE.iter().map(|&m| m.into()).collect(),
         _ => TRACKS.iter().map(|t| format!("{t}px")).collect(),
     }
 }
 
 /// The Text choices saved in the config; a missing value, or one not on the menu, is the default.
-fn text_of(cfg: &Config) -> [usize; 4] {
+fn text_of(cfg: &Config) -> [usize; 6] {
     let at = |list: &[f32], v: Option<f32>, k: usize| v.and_then(|v| list.iter().position(|&x| x == v)).unwrap_or(TEXT_DEFAULT[k]);
-    [0, at(&SIZES, cfg.font_size, 1), at(&LINES, cfg.line_height, 2), at(&TRACKS, cfg.letter_spacing, 3)]
+    let accent = ACCENTS.iter().position(|a| a.0.eq_ignore_ascii_case(&cfg.accent)).unwrap_or(0);
+    let window = usize::from(cfg.maximize.eq_ignore_ascii_case("window"));
+    [0, at(&SIZES, cfg.font_size, 1), at(&LINES, cfg.line_height, 2), at(&TRACKS, cfg.letter_spacing, 3), accent, window]
+}
+
+/// `t` with Accent choice `i` as its accent (and cursor); 0 keeps the theme's own.
+fn with_accent(mut t: Theme, i: usize) -> Theme {
+    if i > 0 {
+        let c = ACCENTS[i].1;
+        let bright = (c >> 16 & 0xff) * 299 + (c >> 8 & 0xff) * 587 + (c & 0xff) * 114 > 150_000;
+        (t.accent, t.cursor, t.on_accent) = (c, c, if bright { 0x121212 } else { 0xffffff });
+    }
+    t
 }
 
 /// Terminal and title fonts for the Text choices `text` (see `TEXT_DEFAULT`).
-fn text_fonts(text: [usize; 4], scale: f32) -> (Font, Font) {
+fn text_fonts(text: [usize; 6], scale: f32) -> (Font, Font) {
     let (k, track) = (SIZES[text[1]] / 100.0 * scale, TRACKS[text[3]] * scale);
     (Font::new(FONT_PX * k).spaced(LINES[text[2]], track), Font::medium(TITLE_PX * k).spaced(0.0, track))
 }
@@ -348,7 +368,7 @@ struct Ui {
     menu_sel: Option<usize>,            // highlighted dropdown row (hover or keyboard)
     sub: Option<usize>,                 // open Text submenu
     sub_sel: Option<usize>,             // highlighted row of it
-    text: [usize; 4],                   // Text choices, see TEXT_DEFAULT
+    text: [usize; 6],                   // submenu choices, see TEXT_DEFAULT
     picker: Option<Picker>,             // folder / drive picker of a panel header; modal like the dropdown
     pick_scroll: f32,                   // wheel distance not yet worth a row
     pick_rehover: bool,                 // the wheel scrolled the picker: the highlight must follow the row under the pointer
@@ -476,7 +496,7 @@ impl Ui {
 
     /// Which window edge/corner (if any) is under the pointer; the window has no OS frame to resize from.
     fn edge_at(&self, x: i32, y: i32) -> Option<ResizeDirection> {
-        if self.window.is_maximized() {
+        if self.maximized() {
             return None;
         }
         let s = self.window.inner_size();
@@ -494,6 +514,11 @@ impl Ui {
             (_, _, _, true) => Some(South),
             _ => None,
         }
+    }
+
+    /// Maximized, or in borderless fullscreen (what the maximize button does by default, see MAXIMIZE).
+    fn maximized(&self) -> bool {
+        self.window.is_maximized() || self.window.fullscreen().is_some()
     }
 
     fn card_w(&self) -> i32 {
@@ -896,7 +921,7 @@ impl Ui {
             View::Grid => "grid",
             View::Cards => "carousel",
         };
-        let [font, size, line, track] = self.text;
+        let [font, size, line, track, accent, window] = self.text;
         config::save(&[
             ("theme", format!("{:?}", THEME_NAMES[self.theme].to_lowercase())),
             ("view", format!("{view:?}")),
@@ -904,6 +929,8 @@ impl Ui {
             ("font_size", SIZES[size].to_string()),
             ("line_height", LINES[line].to_string()),
             ("letter_spacing", TRACKS[track].to_string()),
+            ("accent", format!("{:?}", ACCENTS[accent].0.to_lowercase())),
+            ("maximize", format!("{:?}", ["fullscreen", "window"][window])),
         ]);
     }
 
@@ -1014,7 +1041,16 @@ impl Ui {
             }
             Action::Nop => {}
             Action::Minimize => self.window.set_minimized(true),
-            Action::ToggleMaximize => self.window.set_maximized(!self.window.is_maximized()),
+            Action::ToggleMaximize => {
+                if self.maximized() {
+                    self.window.set_fullscreen(None);
+                    self.window.set_maximized(false);
+                } else if self.text[5] == 0 {
+                    self.window.set_fullscreen(Some(Fullscreen::Borderless(None))); // the monitor the window is on
+                } else {
+                    self.window.set_maximized(true);
+                }
+            }
             Action::CloseWindow => self.quit = true,
         }
     }
@@ -1261,12 +1297,20 @@ impl Ui {
             }
         }
         if ctrl && !alt && *key == Key::Named(NamedKey::Tab) {
-            // next (or previous, with Shift) panel that is not on its way out; in Space view, one of this space
-            let n = self.panes.len();
-            let step = if shift { n - 1 } else { 1 };
+            // next panel that is not on its way out; in Space view, one of this space. With Shift: the next space
             let space = self.active_space();
+            if shift {
+                let ids: Vec<usize> = self.spaces.iter().map(|s| s.id).collect();
+                let at = ids.iter().position(|&id| id == space).unwrap_or(0);
+                let live = |id: usize| self.panes.iter().position(|p| p.space == id && !p.closing);
+                if let Some(j) = (1..=ids.len()).find_map(|k| live(ids[(at + k) % ids.len()])) {
+                    self.focus_pane(j);
+                }
+                return;
+            }
+            let n = self.panes.len();
             let shown = |j: usize| !self.panes[j].closing && (self.view != View::Space || self.panes[j].space == space);
-            if let Some(j) = (1..=n).map(|k| (self.focus + k * step) % n).find(|&j| shown(j)) {
+            if let Some(j) = (1..=n).map(|k| (self.focus + k) % n).find(|&j| shown(j)) {
                 self.focus_pane(j);
             }
             return;
@@ -1586,7 +1630,7 @@ impl Ui {
         let (Some(nw), Some(nh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         let (w, h) = (size.width as i32, size.height as i32);
         let slots = self.slots();
-        let (hh, maximized, scale) = (self.toolbar_h(), self.window.is_maximized(), self.scale);
+        let (hh, maximized, scale) = (self.toolbar_h(), self.maximized(), self.scale);
         // Repaint only where hover fades changed, unless something else changed too (or the size did).
         let resized = self.frame.len() != (w * h) as usize;
         if resized {
@@ -1605,7 +1649,7 @@ impl Ui {
         let (hooks, focused, clock) = (self.hooks, self.focused, self.started.elapsed().as_secs_f32());
         let mut mark = None; // the live prompt mark's cell, if one is on screen
         let Ui { surface, frame, font, ui_font: ui, title_font: titlef, close_font: closef, icon_font: icons, panes, hits, focus, view, menu_open, menu_sel, sub, sub_sel, text, picker, fades, themes, theme, spaces, rename, search, .. } = self;
-        let th = themes[*theme];
+        let th = with_accent(themes[*theme], text[4]);
         let mut cv = Canvas::new(frame.as_mut_slice(), w, h);
         cv.set_bounds(area);
         cv.rect(Rect { x: 0, y: 0, w, h }, th.ui_bg);
@@ -2216,26 +2260,32 @@ fn edit_key(f: &mut Picker, key: &Key, ctrl: bool, alt: bool) {
 /// a 1px separator between groups, hover/keyboard highlight. Text rows show their current choice and a "›";
 /// `sub` is the open Text submenu (and its highlighted row), drawn beside its row. `text`: see TEXT_DEFAULT.
 #[allow(clippy::too_many_arguments)]
-fn draw_menu(cv: &mut Canvas, ui: &mut Font, icons: &mut Font, c: &Chrome, text: [usize; 4], sub: Option<(usize, Option<usize>)>, hits: &mut Vec<(Rect, Action)>) {
+fn draw_menu(cv: &mut Canvas, ui: &mut Font, icons: &mut Font, c: &Chrome, text: [usize; 6], sub: Option<(usize, Option<usize>)>, hits: &mut Vec<(Rect, Action)>) {
     let (th, s) = (c.th, c.scale);
     let hover_bg = blend(th.ui_bg, th.ui_fg, 26);
-    let mut items: Vec<(&str, bool)> = THEME_NAMES.iter().enumerate().map(|(i, n)| (*n, c.theme == i)).collect();
-    items.extend([("Space", c.view == View::Space), ("Grid", c.view == View::Grid), ("Carousel", c.view == View::Cards)]);
-    let (themes, texts) = (THEME_NAMES.len(), items.len());
-    items.extend(TEXT_ROWS.map(|r| (r, false)));
-    let claude = items.len();
-    items.push(("Install hooks", c.hooks)); // checked once every Claude account runs them
+    let items: Vec<(&str, bool)> = MENU_ACTIONS
+        .iter()
+        .map(|a| match *a {
+            Action::SetTheme(i) => (THEME_NAMES[i], c.theme == i),
+            Action::SetView(v) => (["Space", "Grid", "Carousel"][v as usize], c.view == v),
+            Action::SubMenu(k) => (TEXT_ROWS[k], false),
+            _ => ("Install hooks", c.hooks), // checked once every Claude account runs them
+        })
+        .collect();
     let values: Vec<String> = (0..TEXT_ROWS.len()).map(|k| text_choices(k).swap_remove(text[k])).collect();
     let (item_h, label_h, pad, col) = (px(32.0, s), px(28.0, s), px(4.0, s), px(32.0, s)); // col: the check column
     let (sep, arrow) = (2 * px(4.0, s) + 1, ui.width("›"));
-    let widest = items.iter().enumerate().map(|(i, it)| ui.width(it.0) + if (texts..claude).contains(&i) { px(24.0, s) + ui.width(&values[i - texts]) + arrow } else { 0 }).max().unwrap_or(0);
+    let widest = items.iter().zip(MENU_ACTIONS).map(|(it, a)| ui.width(it.0) + if let Action::SubMenu(k) = a { px(24.0, s) + ui.width(&values[k]) + arrow } else { 0 }).max().unwrap_or(0);
     let menu_w = (col + widest + px(24.0, s) + 2 * pad + 2).max(px(200.0, s));
     let menu = Rect { x: 0, y: px(HEADER, s), w: menu_w, h: 2 * pad + 2 + 4 * label_h + items.len() as i32 * item_h + 3 * sep };
     cv.card(menu, RADIUS, th.border, th.ui_bg);
     let mut y = menu.y + 1 + pad;
     let mut menu_hits = Vec::new();
     let mut anchor = None; // the row the open submenu hangs from
-    for (gi, (name, range)) in [("Theme", 0..themes), ("View", themes..texts), ("Text", texts..claude), ("Claude", claude..items.len())].into_iter().enumerate() {
+    let mut start = 0;
+    for (gi, (name, n)) in MENU_GROUPS.into_iter().enumerate() {
+        let range = start..start + n;
+        start += n;
         if gi > 0 {
             cv.rect(Rect { x: menu.x + 1, y: y + px(4.0, s), w: menu.w - 2, h: 1 }, th.border);
             y += sep;
@@ -2852,6 +2902,17 @@ mod header_preview {
             (total_h, width) = (total_h + h + 6, w);
         }
         write_png(&path, width as usize, total_h as usize, &all);
+    }
+
+    #[test]
+    fn accent_and_maximize_come_from_the_config() {
+        let c: Config = toml::from_str("accent = \"Blue\"\nmaximize = \"window\"").unwrap();
+        assert_eq!(text_of(&c)[4..], [2, 1]);
+        assert_eq!(text_of(&Config::default())[4..], [0, 0], "unset: the theme's own accent, borderless fullscreen");
+        let t = with_accent(Theme::dark(), 2);
+        assert_eq!((t.accent, t.cursor, t.on_accent), (0x4f86d9, 0x4f86d9, 0xffffff));
+        assert_eq!(with_accent(Theme::dark(), 0).accent, Theme::dark().accent);
+        assert_eq!(MENU_GROUPS.iter().map(|g| g.1).sum::<usize>(), MENU_ACTIONS.len(), "every row is in a group");
     }
 
     #[test]

@@ -178,6 +178,8 @@ pub struct Config {
     pub font_size: Option<f32>,
     pub line_height: Option<f32>,
     pub letter_spacing: Option<f32>,
+    pub accent: String,
+    pub maximize: String,
     pub light: ThemeCfg,
     pub dark: ThemeCfg,
     pub friendly: ThemeCfg,
@@ -276,6 +278,8 @@ font = "JetBrains Mono"  # the only font for now
 font_size = 100          # percent: 85, 90, 100, 110, 125 or 150
 line_height = 0          # terminal rows, times the font size: 0 (the font's own), 1.2, 1.4, 1.6 or 1.8
 letter_spacing = 0       # px: 0, 0.5, 1, 1.5 or 2
+accent = "default"       # "default" (the theme's own), "terracotta", "blue", "teal", "violet" or "rose"
+maximize = "fullscreen"  # the maximize button: "fullscreen" (borderless, covers the taskbar) or "window"
 
 # Optional color overrides, per theme ([light], [dark] or [friendly]; hex). ansi takes up to 16 entries.
 # [dark]
