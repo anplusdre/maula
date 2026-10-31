@@ -2,7 +2,7 @@
 
 A terminal workspace for [Claude Code](https://claude.com/claude-code). It runs several terminals side by side in one native window, keeps a memory of each Claude session, and tells you which panel is waiting on you.
 
-Written in Rust and drawn in software (winit + softbuffer + fontdue), so there is no web view and no GPU requirement. It's built for Windows and runs PowerShell or Git Bash.
+Written in Rust with no third-party crates: the window, the font rasterizer and the terminal are its own code on top of Win32, drawn in software, so there is no web view and no GPU requirement. It's built for Windows and runs PowerShell or Git Bash. The installer ships Microsoft's [OpenConsole](https://github.com/microsoft/terminal) (the ConPTY that Windows Terminal uses), which handles heavy output faster than the one built into Windows.
 
 ![Space view, light theme](docs/light.png)
 
@@ -66,7 +66,9 @@ The dropdown sets the theme and its accent colour, the view, what maximize does 
 
 ## Install
 
-Build it with Rust 1.85+ (edition 2024):
+Download `maula-setup-<version>.exe` from [Releases](https://github.com/anplusdre/maula/releases) and run it. It installs per user (no admin rights) and needs Windows 10 1809 or later.
+
+To build it yourself, with Rust 1.85+ (edition 2024):
 
 ```sh
 cargo build --release
