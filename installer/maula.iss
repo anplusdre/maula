@@ -32,6 +32,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\maula.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Microsoft's newer ConPTY (OpenConsole): maula loads the conpty.dll next to it, which starts x64\OpenConsole.exe
+Source: "..\assets\conpty\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\conpty\x64\OpenConsole.exe"; DestDir: "{app}\x64"; Flags: ignoreversion
+Source: "..\assets\conpty\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "OpenConsole-LICENSE.txt"
 Source: "..\assets\JetBrainsMono-OFL.txt"; DestDir: "{app}\licenses"
 Source: "..\assets\Lucide-LICENSE.txt"; DestDir: "{app}\licenses"
 
