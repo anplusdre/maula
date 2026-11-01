@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use suggest::Suggest;
-use term::{Term, BLANK};
+use term::{Mouse, MouseEv, Term, BLANK};
 use window::{Control, CursorIcon, ElementState, Event, Key, KeyEvent, ModifiersState, MouseButton, MouseScrollDelta, NamedKey, ResizeDirection, Window};
 use std::{
     collections::HashMap,
@@ -115,6 +115,17 @@ const BASH_PS1: &str = r"PS1='\[\e]133;A\a\]   '";
 /// output chunks it received. A healthy idle app prints zeros.
 static DRAWS: AtomicU32 = AtomicU32::new(0);
 static OUTPUTS: AtomicU32 = AtomicU32::new(0);
+
+/// Dev aid: with `MAULA_RECORD=<dir>` every panel's raw shell output is appended to `<dir>/pane-<id>.out`, its resizes
+/// in-band as `ESC _ maula-resize;<cols>;<rows> ESC \` (an APC, which the terminal ignores), so a session can be
+/// replayed through `Term` byte for byte.
+fn record(id: usize, bytes: &[u8]) {
+    let Some(dir) = std::env::var_os("MAULA_RECORD") else { return };
+    let path = PathBuf::from(dir).join(format!("pane-{id}.out"));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(bytes);
+    }
+}
 
 enum Ev {
     Output(usize, Vec<u8>),
@@ -355,6 +366,9 @@ struct Ui {
     mouse: (i32, i32),
     hits: Vec<(Rect, Action)>,
     drag: Option<usize>, // pane index being drag-selected
+    app_drag: Option<(usize, u8)>, // (pane index, button) pressed inside a program that owns the mouse
+    app_cell: Option<(usize, usize, usize)>, // (pane, col, row) of the last motion reported, so each cell is sent once
+    wheel_acc: f32,      // wheel notches not yet sent to a program that owns the mouse
     hover: Option<usize>, // index into `hits` under the mouse
     last_header_click: Option<Instant>, // for double-click to maximize
     menu_open: bool,                    // theme / view dropdown
@@ -431,6 +445,9 @@ impl Ui {
             mouse: (0, 0),
             hits: Vec::new(),
             drag: None,
+            app_drag: None,
+            app_cell: None,
+            wheel_acc: 0.0,
             hover: None,
             last_header_click: None,
             menu_open: false,
@@ -609,6 +626,7 @@ impl Ui {
             let (cols, rows) = ((r.w / self.font.cw).max(2) as usize, (r.h / self.font.ch).max(1) as usize);
             let p = &mut self.panes[i];
             if (cols, rows) != (p.term.cols, p.term.rows) {
+                record(p.id, format!("_maula-resize;{cols};{rows}\\").as_bytes());
                 p.term.resize(cols, rows);
                 p.sel = None; // its line numbers point at the old wrapping
                 p.master.resize(cols, rows);
@@ -829,6 +847,10 @@ impl Ui {
 
     fn focus_pane(&mut self, i: usize) {
         if i < self.panes.len() {
+            if i != self.focus && self.focused {
+                self.focus_report(self.focus, false);
+                self.focus_report(i, true);
+            }
             self.focus = i;
             self.panes[i].attention = false; // seen
             self.relayout();
@@ -1097,6 +1119,7 @@ impl Ui {
         let Some(i) = self.panes.iter().position(|p| p.id == id) else { return };
         let p = &mut self.panes[i];
         let before = p.term.scroll;
+        record(id, bytes);
         p.term.feed(bytes);
         if p.term.scroll > before {
             let moved = (p.term.scroll - before) as f32; // the content kept its place: shift, do not animate
@@ -1349,6 +1372,39 @@ impl Ui {
 
     // ---- mouse ----
 
+    /// Tells pane `i`'s program it gained or lost focus, if it asked to know (DECSET 1004).
+    fn focus_report(&mut self, i: usize, on: bool) {
+        if let Some(p) = self.panes.get_mut(i).filter(|p| p.term.focus_events) {
+            let _ = p.writer.write_all(if on { b"[I" } else { b"[O" });
+            let _ = p.writer.flush();
+        }
+    }
+
+    /// The program in pane `i` wants mouse reports, and Shift (which keeps the mouse for maula: select, scrollback)
+    /// is not held.
+    fn app_mouse(&self, i: usize) -> bool {
+        self.panes[i].term.mouse != Mouse::Off && !self.mods.shift_key()
+    }
+
+    /// Reports `ev` at (`x`, `y`) to pane `i`'s program; false when it did not ask for that kind of event.
+    fn report_mouse(&mut self, i: usize, inner: Rect, (x, y): (i32, i32), ev: MouseEv) -> bool {
+        let mods = if self.mods.alt_key() { 8 } else { 0 } + if self.mods.control_key() { 16 } else { 0 };
+        let (cw, ch) = (self.font.cw, self.font.ch);
+        let p = &mut self.panes[i];
+        let col = ((x - inner.x) / cw).clamp(0, p.term.cols as i32 - 1) as usize;
+        let row = ((y - inner.y) / ch).clamp(0, p.term.rows as i32 - 1) as usize;
+        if matches!(ev, MouseEv::Move(_)) {
+            if self.app_cell == Some((i, col, row)) {
+                return true; // still the same cell: nothing new to say
+            }
+            self.app_cell = Some((i, col, row));
+        }
+        let Some(bytes) = p.term.mouse_report(ev, col, row, mods) else { return false };
+        let _ = p.writer.write_all(&bytes);
+        let _ = p.writer.flush();
+        true
+    }
+
     fn cell_at(&self, i: usize, inner: Rect, x: i32, y: i32) -> Pos {
         let t = &self.panes[i].term;
         let col = ((x - inner.x) / self.font.cw).clamp(0, t.cols as i32 - 1) as usize;
@@ -1358,9 +1414,34 @@ impl Ui {
 
     fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         let (x, y) = self.mouse;
+        let code = match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        };
         if state == ElementState::Released {
             self.drag = None;
+            if let Some((i, b)) = self.app_drag.filter(|&(_, b)| b == code) {
+                self.app_drag = None;
+                if let Some((_, _, inner)) = self.slots().into_iter().find(|s| s.0 == i) {
+                    self.report_mouse(i, inner, (x, y), MouseEv::Release(b));
+                }
+            }
             return;
+        }
+        if button != MouseButton::Right && !self.modal() && !self.hits.iter().any(|(r, _)| r.contains(x, y)) && self.edge_at(x, y).is_none() {
+            // a program that owns the mouse (Claude Code's full-screen view, vim, htop) gets the click; right click
+            // stays maula's copy/paste
+            if let Some((i, _, inner)) = self.hit_pane(x, y).filter(|&(i, _, inner)| inner.contains(x, y) && self.app_mouse(i)) {
+                if i != self.focus {
+                    self.focus_pane(i);
+                }
+                self.commit_rename();
+                if self.report_mouse(i, inner, (x, y), MouseEv::Press(code)) {
+                    self.app_drag = Some((i, code));
+                }
+                return;
+            }
         }
         match button {
             MouseButton::Left => {
@@ -1445,7 +1526,7 @@ impl Ui {
             Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => CursorIcon::NeswResize,
             None if hover.is_some_and(|h| matches!(self.hits[h].1, Action::Search)) => CursorIcon::Text,
             None if hover.is_some() => CursorIcon::Pointer,
-            None if over_text => CursorIcon::Text,
+            None if over_text && !self.hit_pane(x, y).is_some_and(|(i, ..)| self.app_mouse(i)) => CursorIcon::Text,
             None => CursorIcon::Default,
         };
         if icon != self.icon {
@@ -1482,6 +1563,16 @@ impl Ui {
             self.partial_ok = !self.modal(); // a hover fade only repaints its own rectangle
             self.window.request_redraw();
         }
+        if moved {
+            let target = match self.app_drag {
+                Some((i, b)) => self.slots().into_iter().find(|s| s.0 == i).map(|s| (i, s.2, Some(b))),
+                None if !self.modal() => self.hit_pane(x, y).filter(|&(i, _, inner)| inner.contains(x, y) && self.app_mouse(i)).map(|(i, _, inner)| (i, inner, None)),
+                None => None,
+            };
+            if let Some((i, inner, b)) = target {
+                self.report_mouse(i, inner, (x, y), MouseEv::Move(b));
+            }
+        }
         let Some(i) = self.drag else { return };
         let Some((_, outer, inner)) = self.slots().into_iter().find(|s| s.0 == i) else { return };
         let head = self.cell_at(i, inner, x, y);
@@ -1512,6 +1603,17 @@ impl Ui {
             }
             return self.picker_changed();
         }
+        if let Some((i, _, inner)) = self.hit_pane(self.mouse.0, self.mouse.1).filter(|&(i, ..)| self.app_mouse(i)) {
+            // the program scrolls itself: one wheel report per notch, a touchpad's small deltas adding up to one
+            self.wheel_acc += dy / 3.0;
+            while self.wheel_acc.abs() >= 1.0 {
+                let up = self.wheel_acc > 0.0;
+                self.report_mouse(i, inner, self.mouse, if up { MouseEv::WheelUp } else { MouseEv::WheelDown });
+                self.wheel_acc -= if up { 1.0 } else { -1.0 };
+            }
+            return;
+        }
+        self.wheel_acc = 0.0;
         if let Some((i, outer, _)) = self.hit_pane(self.mouse.0, self.mouse.1) {
             let p = &mut self.panes[i];
             // keep the fractional part: small touchpad deltas add up instead of being rounded away
@@ -1805,8 +1907,8 @@ fn draw_term(cv: &mut Canvas, font: &mut Font, t: &Term, scroll_pos: f32, sel: O
 /// Thin scrollbar on the panel's outer right edge, shown once there is scrollback. Its track starts below the
 /// panel header and stops above the bottom border, so it never overlaps either.
 fn draw_scrollbar(cv: &mut Canvas, t: &Term, scroll_pos: f32, th: &Theme, outer: Rect, header_h: i32, scale: f32) {
-    if t.history.is_empty() {
-        return;
+    if t.history.is_empty() || t.mouse != Mouse::Off {
+        return; // nothing scrolled off, or the program scrolls itself (the wheel goes to it)
     }
     let hist = t.history.len() as f32;
     let top = hist - scroll_pos.clamp(0.0, hist);
@@ -2521,6 +2623,9 @@ impl App {
         match ev {
             Event::Close => ui.quit = true,
             Event::Focused(f) => {
+                if f != ui.focused {
+                    ui.focus_report(ui.focus, f);
+                }
                 ui.focused = f;
                 if f {
                     ui.panes[ui.focus].attention = false;

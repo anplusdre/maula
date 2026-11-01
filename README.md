@@ -51,6 +51,7 @@ The dropdown sets the theme and its accent colour, the view, what maximize does 
 - Typing `cd` plus three or more characters suggests matching sub-folders.
 - Ctrl+click opens links in the browser and `path:line:col` in your editor (`editor = "code -g"`).
 - Ctrl+C copies while text is selected; otherwise it sends ^C.
+- Programs that use the mouse (Claude Code's full-screen view, vim, htop) get the wheel, clicks and focus changes; hold Shift to select text or scroll maula's own scrollback instead.
 
 ### Keyboard shortcuts
 
