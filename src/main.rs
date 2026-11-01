@@ -251,6 +251,10 @@ fn shell_command(shell: Option<&str>) -> (String, Vec<&'static str>, Vec<(&'stat
 /// `ipc`: the hook listener's (port, token), handed to the shell so `maula hook` can report back to this panel.
 fn spawn_pty(proxy: &Proxy, id: usize, shell: Option<&str>, dir: Option<&Path>, ipc: Option<&(u16, String)>) -> (win::Pty, std::fs::File) {
     let (exe, args, mut env) = shell_command(shell);
+    // Claude Code keeps its classic renderer here: its full-screen one draws on an alternate screen with its own
+    // scrollback, which leaves maula's scrollback, scrollbar, search and selection with nothing to work on.
+    // Wins over Claude's `tui` setting and its full-screen trials; only shells started by maula get it.
+    env.push(("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1".to_string()));
     if let Some((port, token)) = ipc {
         env.extend([("MAULA_PANE", id.to_string()), ("MAULA_PORT", port.to_string()), ("MAULA_TOKEN", token.clone())]);
     }
