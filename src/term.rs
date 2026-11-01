@@ -697,6 +697,9 @@ impl Term {
             b'J' => match p[0] {
                 0 => self.fill(i, cols * rows),
                 1 => self.fill(0, i + 1),
+                // erase saved lines: ignored. TUIs (Claude Code, via ConPTY) send `2J 3J` on every full repaint,
+                // i.e. on each resize and focus change, which would wipe the scrollback for good
+                3 => {}
                 _ => self.fill(0, cols * rows),
             },
             b'K' => match p[0] {
@@ -862,6 +865,8 @@ mod tests {
         assert_eq!(t.scroll, 2); // clamped
         t.feed(b"\r\ne"); // output while scrolled back keeps the place
         assert_eq!(t.line(t.view_start())[0].ch, 'a');
+        t.feed(b"\x1b[3J"); // a TUI repainting: scrollback and screen both kept
+        assert_eq!((t.history.len(), t.dump().as_str()), (3, "d\ne"));
     }
 
     #[test]
