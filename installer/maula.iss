@@ -3,7 +3,7 @@
 ; Output: target\installer\maula-setup-<version>.exe
 ; Installs per user (no admin prompt) into %LOCALAPPDATA%\Programs\maula.
 
-#define Version "0.1.0"
+#define Version "0.1.1"
 
 [Setup]
 ; never change AppId: it is how upgrades and the uninstaller find an existing install
