@@ -44,6 +44,7 @@ The dropdown sets the theme and its accent colour, the view, what maximize does 
 
 - **Install hooks** (dropdown → Claude) adds maula's hooks to every Claude account's `settings.json`, and keeps a backup as `settings.json.maula-bak`. maula then knows which session runs in which panel and when Claude stops or asks something.
 - **Render** (dropdown → Claude): *Terminal* is the character grid. *Software* draws Claude's running text in a proportional font, as a desktop app would, and keeps code, tables and diagrams on the grid. It applies to panels where the hooks report Claude running, on its classic renderer.
+- **Panel note from Claude**: with the hooks installed, a Claude session started in a panel is told (via the SessionStart hook) that it can run `maula note read`, `maula note write "text"` (or `-` for stdin), `maula note append "text"` and `maula note clear` to read and edit that panel's note. It talks to the window over loopback only, using the pane's `MAULA_PANE`, `MAULA_NOTE_PORT` and `MAULA_TOKEN` variables; text is plain UTF-8, up to 8 MB. Without the hooks, tell Claude the commands yourself.
 - **MEMORY** (panel header): while it's on, a summary of the session (what you needed, the decisions made, open items) is saved to `.maula/memory` in the project, so a later session or another account can pick it up.
 
 ### Terminal niceties
@@ -53,6 +54,7 @@ The dropdown sets the theme and its accent colour, the view, what maximize does 
 - Ctrl+click opens links in the browser and `path:line:col` in your editor (`editor = "code -g"`).
 - To select more than fits on screen, drag past the top or bottom of a panel, or use the wheel while dragging.
 - Ctrl+C copies while text is selected; otherwise it sends ^C.
+- `clear` / `cls` also clears maula's scrollback. A full-screen program's own clear (and the repaint right after a resize) leaves it alone.
 - Programs that use the mouse (Claude Code's full-screen view, vim, htop) get the wheel, clicks and focus changes; hold Shift to select text or scroll maula's own scrollback instead.
 
 ### Keyboard shortcuts

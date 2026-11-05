@@ -21,7 +21,7 @@ const FALLBACKS: &[&str] = &[
     r"C:\Windows\Fonts\seguiemj.ttf",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -84,6 +84,7 @@ pub struct Font {
     pub ch: i32,
     pub ascent: i32,
     pub track: f32, // letter-spacing set by `spaced`, already counted in `cw`
+    pub fake_bold: bool, // asked for bold but no bold face was found: the caller draws each glyph twice, 1px apart
     primary: Face,
     fallbacks: Vec<Fallback>,
     px: f32,
@@ -113,6 +114,22 @@ impl Font {
         Font { ascent, ..Self::with(face, px) }
     }
 
+    /// Segoe UI in the notepad's styles. Each variant is its own file (segoeui, segoeuib, segoeuii, segoeuiz); one that is
+    /// missing falls back to the regular face (bold then sets `fake_bold`; italic stays upright), and without Segoe UI
+    /// to the bundled font.
+    pub fn note(px: f32, bold: bool, italic: bool) -> Self {
+        let file = match (bold, italic) {
+            (false, false) => "segoeui",
+            (true, false) => "segoeuib",
+            (false, true) => "segoeuii",
+            (true, true) => "segoeuiz",
+        };
+        let exact = load(&format!(r"C:\Windows\Fonts\{file}.ttf"));
+        let found = exact.is_some();
+        let face = exact.or_else(|| load(r"C:\Windows\Fonts\segoeui.ttf")).or_else(|| Face::parse(BUNDLED)).expect("no font found");
+        Font { fake_bold: bold && !found, ..Self::with(face, px) }
+    }
+
     /// How far the pen moves after `c`.
     pub fn advance(&mut self, c: char) -> f32 {
         self.glyph(c).adv
@@ -140,6 +157,7 @@ impl Font {
             ch: (ascent - descent).ceil() as i32,
             ascent: ascent.round() as i32,
             track: 0.0,
+            fake_bold: false,
             primary,
             fallbacks: FALLBACKS.iter().map(|&path| Fallback { path, font: None, tried: false }).collect(),
             px,
