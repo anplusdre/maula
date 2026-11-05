@@ -177,6 +177,7 @@ pub struct Config {
     pub letter_spacing: Option<f32>,
     pub accent: String,
     pub maximize: String,
+    pub render: String,
     pub light: ThemeCfg,
     pub dark: ThemeCfg,
     pub friendly: ThemeCfg,
@@ -509,6 +510,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         letter_spacing: top.num("letter_spacing"),
         accent: top.str("accent").unwrap_or_default(),
         maximize: top.str("maximize").unwrap_or_default(),
+        render: top.str("render").unwrap_or_default(),
         light: theme("light"),
         dark: theme("dark"),
         friendly: theme("friendly"),
@@ -553,6 +555,7 @@ line_height = 0          # terminal rows, times the font size: 0 (the font's own
 letter_spacing = 0       # px: 0, 0.5, 1, 1.5 or 2
 accent = "default"       # "default" (the theme's own), "terracotta", "blue", "teal", "violet" or "rose"
 maximize = "fullscreen"  # the maximize button: "fullscreen" (borderless, covers the taskbar) or "window"
+render = "terminal"      # panels running Claude: "terminal" (the character grid) or "software" (running text in Segoe UI); needs the hooks
 
 # Optional color overrides, per theme ([light], [dark] or [friendly]; hex). ansi takes up to 16 entries.
 # [dark]
