@@ -1,7 +1,8 @@
 //! Config file (TOML) and themes. Everything lives in one folder: see `config_dir`.
+//! ponytail: a TOML subset (key = value, [table], [[array]], strings, numbers, booleans, arrays): no inline tables,
+//! dotted keys, multi-line strings or dates. maula's own files never need them.
 
 use crate::term::Color;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
@@ -137,8 +138,7 @@ impl Theme {
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
+#[derive(Default)]
 pub struct ThemeCfg {
     background: Option<String>,
     foreground: Option<String>,
@@ -155,8 +155,7 @@ pub struct ThemeCfg {
     ansi: Vec<String>,
 }
 
-#[derive(Deserialize, Default, Clone)]
-#[serde(default)]
+#[derive(Default, Clone)]
 pub struct PanelCfg {
     pub name: String,
     pub dir: Option<String>,
@@ -166,20 +165,19 @@ pub struct PanelCfg {
     pub accent: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub theme: String,
     pub view: String,
     pub shell: Option<String>,
     pub editor: Option<String>,
     pub theme_colors: bool,
-    pub font: String,
     pub font_size: Option<f32>,
     pub line_height: Option<f32>,
     pub letter_spacing: Option<f32>,
     pub accent: String,
     pub maximize: String,
+    pub render: String,
     pub light: ThemeCfg,
     pub dark: ThemeCfg,
     pub friendly: ThemeCfg,
@@ -213,25 +211,25 @@ pub fn hex(s: &str) -> Option<u32> {
 }
 
 /// A space saved from a tab's menu: its name and the folders of its terminals.
-#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
-#[serde(default)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct SavedSpace {
     pub name: String,
     pub dirs: Vec<String>,
+    pub notes: Vec<String>, // the notepad text of each terminal, in the order of `dirs`
+    pub note_styles: Vec<String>, // the notepad's character styles ("start-end:biu:hl;..."), per terminal; may be shorter than `dirs`
+    pub note_size: Vec<f32>,      // the notepad's font size (14: the default), per terminal
+    pub note_line: Vec<f32>,      // the notepad's line height, times the font's own (1: the default), per terminal
 }
 
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-struct SavedFile {
-    space: Vec<SavedSpace>,
-}
+/// The notepad's default font size (what `note_size` holds when nothing was chosen).
+pub const NOTE_SIZE_DEFAULT: f32 = 14.0;
 
 fn spaces_path() -> PathBuf {
     config_dir().join("spaces.toml")
 }
 
 pub fn load_spaces() -> Vec<SavedSpace> {
-    std::fs::read_to_string(spaces_path()).ok().and_then(|s| toml::from_str::<SavedFile>(&s).ok()).map(|f| f.space).unwrap_or_default()
+    std::fs::read_to_string(spaces_path()).ok().and_then(|s| spaces_from_toml(&s).ok()).unwrap_or_default()
 }
 
 /// `s` into `list`, replacing the one with the same name.
@@ -246,14 +244,320 @@ fn upsert(list: &mut Vec<SavedSpace>, s: SavedSpace) {
 pub fn save_space(list: &mut Vec<SavedSpace>, s: SavedSpace) {
     upsert(list, s);
     let _ = std::fs::create_dir_all(config_dir());
-    match toml::to_string(&SavedFile { space: list.clone() }) {
-        Ok(text) => {
-            if let Err(e) = std::fs::write(spaces_path(), text) {
-                eprintln!("maula: cannot save {}: {e}", spaces_path().display());
+    if let Err(e) = std::fs::write(spaces_path(), spaces_to_toml(list)) {
+        eprintln!("maula: cannot save {}: {e}", spaces_path().display());
+    }
+}
+
+// ---- TOML ----
+
+#[derive(Debug, Clone, PartialEq)]
+enum Val {
+    Str(String),
+    Num(f64),
+    Bool(bool),
+    Arr(Vec<Val>),
+}
+
+/// A table: its header (`dark` for `[dark]`, `panel` for each `[[panel]]`, "" for the keys above any header) and its
+/// keys in file order.
+struct Table {
+    name: String,
+    keys: Vec<(String, Val)>,
+}
+
+impl Table {
+    fn get(&self, key: &str) -> Option<&Val> {
+        self.keys.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v) // a repeated key: the last one wins
+    }
+    fn str(&self, key: &str) -> Option<String> {
+        match self.get(key)? {
+            Val::Str(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+    fn num(&self, key: &str) -> Option<f32> {
+        match self.get(key)? {
+            Val::Num(n) => Some(*n as f32),
+            _ => None,
+        }
+    }
+    fn nums(&self, key: &str) -> Vec<f32> {
+        match self.get(key) {
+            Some(Val::Arr(a)) => a.iter().filter_map(|v| if let Val::Num(n) = v { Some(*n as f32) } else { None }).collect(),
+            _ => Vec::new(),
+        }
+    }
+    fn strs(&self, key: &str) -> Vec<String> {
+        match self.get(key) {
+            Some(Val::Arr(a)) => a.iter().filter_map(|v| if let Val::Str(s) = v { Some(s.clone()) } else { None }).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+struct Parser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl Parser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.i).copied()
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        let hit = self.peek() == Some(c);
+        self.i += hit as usize;
+        hit
+    }
+    fn err(&self, msg: &str) -> String {
+        format!("line {}: {msg}", self.s[..self.i.min(self.s.len())].iter().filter(|&&c| c == b'\n').count() + 1)
+    }
+    fn spaces(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t')) {
+            self.i += 1;
+        }
+    }
+    /// Spaces, newlines and comments (between keys, and inside arrays).
+    fn blank(&mut self) {
+        loop {
+            self.spaces();
+            match self.peek() {
+                Some(b'\r' | b'\n') => self.i += 1,
+                Some(b'#') => self.comment(),
+                _ => return,
             }
         }
-        Err(e) => eprintln!("maula: cannot save spaces: {e}"),
     }
+    fn comment(&mut self) {
+        while !matches!(self.peek(), None | Some(b'\n')) {
+            self.i += 1;
+        }
+    }
+    /// The rest of a line after a key's value or a header: only spaces and a comment may follow.
+    fn line_end(&mut self) -> Result<(), String> {
+        self.spaces();
+        if self.peek() == Some(b'#') {
+            self.comment();
+        }
+        match self.peek() {
+            None | Some(b'\n' | b'\r') => Ok(()),
+            _ => Err(self.err("unexpected text after the value")),
+        }
+    }
+    fn key(&mut self) -> Result<String, String> {
+        if matches!(self.peek(), Some(b'"' | b'\'')) {
+            return self.string();
+        }
+        let start = self.i;
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+            self.i += 1;
+        }
+        if start == self.i {
+            return Err(self.err("expected a key"));
+        }
+        if self.peek() == Some(b'.') {
+            return Err(self.err("dotted keys are not supported"));
+        }
+        Ok(String::from_utf8_lossy(&self.s[start..self.i]).into())
+    }
+    fn string(&mut self) -> Result<String, String> {
+        let quote = self.s[self.i];
+        self.i += 1;
+        if self.s[self.i..].starts_with(&[quote, quote]) {
+            return Err(self.err("multi-line strings are not supported"));
+        }
+        let mut out = Vec::new();
+        loop {
+            let Some(c) = self.peek() else { return Err(self.err("unterminated string")) };
+            self.i += 1;
+            match c {
+                b'\n' => return Err(self.err("unterminated string")),
+                _ if c == quote => break,
+                b'\\' if quote == b'"' => {
+                    let e = self.peek().ok_or_else(|| self.err("unterminated string"))?;
+                    self.i += 1;
+                    let simple = match e {
+                        b'"' => Some('"'),
+                        b'\\' => Some('\\'),
+                        b'n' => Some('\n'),
+                        b't' => Some('\t'),
+                        b'r' => Some('\r'),
+                        b'b' => Some('\u{8}'),
+                        b'f' => Some('\u{c}'),
+                        _ => None,
+                    };
+                    let ch = match (simple, e) {
+                        (Some(ch), _) => ch,
+                        (None, b'u' | b'U') => {
+                            let n = if e == b'u' { 4 } else { 8 };
+                            let hex = self.s.get(self.i..self.i + n).and_then(|h| std::str::from_utf8(h).ok());
+                            let ch = hex.and_then(|h| u32::from_str_radix(h, 16).ok()).and_then(char::from_u32);
+                            self.i += n;
+                            ch.ok_or_else(|| self.err("bad \\u escape"))?
+                        }
+                        _ => return Err(self.err("unknown escape in a string (write \\\\ for a backslash, or use 'single quotes')")),
+                    };
+                    out.extend(ch.to_string().bytes());
+                }
+                _ => out.push(c),
+            }
+        }
+        String::from_utf8(out).map_err(|_| self.err("not UTF-8"))
+    }
+    fn value(&mut self) -> Result<Val, String> {
+        match self.peek() {
+            Some(b'"' | b'\'') => self.string().map(Val::Str),
+            Some(b'[') => {
+                self.i += 1;
+                let mut items = Vec::new();
+                loop {
+                    self.blank();
+                    if self.eat(b']') {
+                        return Ok(Val::Arr(items));
+                    }
+                    items.push(self.value()?);
+                    self.blank();
+                    if !self.eat(b',') {
+                        self.blank();
+                        return if self.eat(b']') { Ok(Val::Arr(items)) } else { Err(self.err("expected , or ] in the array")) };
+                    }
+                }
+            }
+            Some(b'{') => Err(self.err("inline tables are not supported")),
+            _ => {
+                let start = self.i;
+                while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || b"+-._".contains(&c)) {
+                    self.i += 1;
+                }
+                let word: String = String::from_utf8_lossy(&self.s[start..self.i]).replace('_', "");
+                match word.as_str() {
+                    "true" => Ok(Val::Bool(true)),
+                    "false" => Ok(Val::Bool(false)),
+                    _ => word.parse().map(Val::Num).map_err(|_| self.err("expected a value: \"text\", a number, true/false or [list]")),
+                }
+            }
+        }
+    }
+}
+
+fn parse(text: &str) -> Result<Vec<Table>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text); // Notepad saves UTF-8 with a byte order mark
+    let mut p = Parser { s: text.as_bytes(), i: 0 };
+    let mut tables = vec![Table { name: String::new(), keys: Vec::new() }];
+    loop {
+        p.blank();
+        if p.peek().is_none() {
+            return Ok(tables);
+        }
+        if p.eat(b'[') {
+            let array = p.eat(b'[');
+            p.spaces();
+            let name = p.key()?;
+            p.spaces();
+            if !p.eat(b']') || (array && !p.eat(b']')) {
+                return Err(p.err("expected ] after the table name"));
+            }
+            tables.push(Table { name, keys: Vec::new() });
+        } else {
+            let key = p.key()?;
+            p.spaces();
+            if !p.eat(b'=') {
+                return Err(p.err("expected = after the key"));
+            }
+            p.spaces();
+            let v = p.value()?;
+            tables.last_mut().unwrap().keys.push((key, v));
+        }
+        p.line_end()?;
+    }
+}
+
+/// `s` as a TOML basic string.
+fn quoted(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out += "\\\"",
+            '\\' => out += "\\\\",
+            '\n' => out += "\\n",
+            '\t' => out += "\\t",
+            c if c.is_control() => out += &format!("\\u{:04X}", c as u32),
+            c => out.push(c),
+        }
+    }
+    out + "\""
+}
+
+/// The config file's text as a `Config`. Unknown keys, and values of the wrong type, are ignored.
+pub fn parse_config(text: &str) -> Result<Config, String> {
+    let tables = parse(text)?;
+    let top = &tables[0];
+    let theme = |name: &str| {
+        let Some(t) = tables.iter().rev().find(|t| t.name == name) else { return ThemeCfg::default() };
+        ThemeCfg {
+            background: t.str("background"),
+            foreground: t.str("foreground"),
+            cursor: t.str("cursor"),
+            selection: t.str("selection"),
+            ui_background: t.str("ui_background"),
+            header_background: t.str("header_background"),
+            ui_foreground: t.str("ui_foreground"),
+            border: t.str("border"),
+            accent: t.str("accent"),
+            on_accent: t.str("on_accent"),
+            muted: t.str("muted"),
+            green: t.str("green"),
+            ansi: t.strs("ansi"),
+        }
+    };
+    let panel = |t: &Table| PanelCfg { name: t.str("name").unwrap_or_default(), dir: t.str("dir"), cmd: t.str("cmd"), bg: t.str("bg"), fg: t.str("fg"), accent: t.str("accent") };
+    Ok(Config {
+        theme: top.str("theme").unwrap_or_default(),
+        view: top.str("view").unwrap_or_default(),
+        shell: top.str("shell"),
+        editor: top.str("editor"),
+        theme_colors: matches!(top.get("theme_colors"), Some(Val::Bool(true))),
+        font_size: top.num("font_size"),
+        line_height: top.num("line_height"),
+        letter_spacing: top.num("letter_spacing"),
+        accent: top.str("accent").unwrap_or_default(),
+        maximize: top.str("maximize").unwrap_or_default(),
+        render: top.str("render").unwrap_or_default(),
+        light: theme("light"),
+        dark: theme("dark"),
+        friendly: theme("friendly"),
+        panel: tables.iter().filter(|t| t.name == "panel").map(panel).collect(),
+    })
+}
+
+fn spaces_from_toml(text: &str) -> Result<Vec<SavedSpace>, String> {
+    Ok(parse(text)?.iter().filter(|t| t.name == "space").map(|t| SavedSpace { name: t.str("name").unwrap_or_default(), dirs: t.strs("dirs"), notes: t.strs("notes"), note_styles: t.strs("note_styles"), note_size: t.nums("note_size"), note_line: t.nums("note_line") }).collect())
+}
+
+fn spaces_to_toml(list: &[SavedSpace]) -> String {
+    let mut out = String::new();
+    for s in list {
+        let dirs: Vec<String> = s.dirs.iter().map(|d| quoted(d)).collect();
+        out += &format!("[[space]]\nname = {}\ndirs = [{}]\n", quoted(&s.name), dirs.join(", "));
+        // the notepad keys are left out while there is nothing to keep; a file without them still loads
+        let strs = |v: &[String]| v.iter().map(|n| quoted(n)).collect::<Vec<_>>().join(", ");
+        let nums = |v: &[f32]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+        if s.notes.iter().any(|n| !n.is_empty()) {
+            out += &format!("notes = [{}]\n", strs(&s.notes));
+        }
+        if s.note_styles.iter().any(|n| !n.is_empty()) {
+            out += &format!("note_styles = [{}]\n", strs(&s.note_styles));
+        }
+        if s.note_size.iter().any(|&n| n != NOTE_SIZE_DEFAULT) {
+            out += &format!("note_size = [{}]\n", nums(&s.note_size));
+        }
+        if s.note_line.iter().any(|&n| n != 1.0) {
+            out += &format!("note_line = [{}]\n", nums(&s.note_line));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 pub fn config_dir() -> PathBuf {
@@ -280,6 +584,7 @@ line_height = 0          # terminal rows, times the font size: 0 (the font's own
 letter_spacing = 0       # px: 0, 0.5, 1, 1.5 or 2
 accent = "default"       # "default" (the theme's own), "terracotta", "blue", "teal", "violet" or "rose"
 maximize = "fullscreen"  # the maximize button: "fullscreen" (borderless, covers the taskbar) or "window"
+render = "terminal"      # panels running Claude: "terminal" (the character grid) or "software" (running text in Segoe UI); needs the hooks
 
 # Optional color overrides, per theme ([light], [dark] or [friendly]; hex). ansi takes up to 16 entries.
 # [dark]
@@ -335,7 +640,7 @@ pub fn save(keys: &[(&str, String)]) {
 pub fn load() -> Config {
     let path = config_dir().join("config.toml");
     match std::fs::read_to_string(&path) {
-        Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
+        Ok(s) => parse_config(&s).unwrap_or_else(|e| {
             eprintln!("maula: bad config {}: {e}", path.display());
             Config::default()
         }),
@@ -353,22 +658,63 @@ mod tests {
 
     #[test]
     fn saved_spaces_round_trip_and_replace_by_name() {
-        let space = |name: &str, dirs: &[&str]| SavedSpace { name: name.into(), dirs: dirs.iter().map(|d| d.to_string()).collect() };
+        let space = |name: &str, dirs: &[&str]| SavedSpace { name: name.into(), dirs: dirs.iter().map(|d| d.to_string()).collect(), ..Default::default() };
         let mut list = vec![];
         upsert(&mut list, space("api", &["D:/a", "D:/b"]));
         upsert(&mut list, space("web", &["D:/w"]));
         upsert(&mut list, space("api", &["D:/c"]));
         assert_eq!(list, [space("api", &["D:/c"]), space("web", &["D:/w"])], "same name: replaced in place");
-        let text = toml::to_string(&SavedFile { space: list.clone() }).unwrap();
-        assert_eq!(toml::from_str::<SavedFile>(&text).unwrap().space, list);
-        assert!(toml::from_str::<SavedFile>("").unwrap().space.is_empty(), "no file content: no spaces");
+        list.push(space("odd \"name\"", &[r"C:\Users\me", "tab\there", "naïve 中"]));
+        let text = spaces_to_toml(&list);
+        assert_eq!(spaces_from_toml(&text).unwrap(), list, "quotes, backslashes, tabs and non-ASCII survive");
+        assert!(spaces_from_toml("").unwrap().is_empty(), "no file content: no spaces");
+    }
+
+    #[test]
+    fn saved_notes_keep_their_styles_size_and_line_height() {
+        let rich = SavedSpace {
+            name: "w".into(),
+            dirs: vec!["D:/a".into(), "D:/b".into()],
+            notes: vec!["line one\n\"two\" \\ \u{4e2d}".into(), String::new()],
+            note_styles: vec!["0-4:bi;5-8::2".into(), String::new()],
+            note_size: vec![18.0, 14.0],
+            note_line: vec![1.5, 1.0],
+        };
+        let plain = SavedSpace { name: "p".into(), dirs: vec!["D:/c".into()], ..Default::default() };
+        let text = spaces_to_toml(&[rich.clone(), plain.clone()]);
+        assert_eq!(spaces_from_toml(&text).unwrap(), [rich, plain.clone()]);
+        assert!(!spaces_to_toml(&[plain]).contains("note"), "nothing to keep: no notepad keys");
+        let old = spaces_from_toml("[[space]]\nname = \"old\"\ndirs = [\"D:/x\"]\n").unwrap();
+        assert!(old[0].note_styles.is_empty() && old[0].note_size.is_empty(), "files from before styles still load");
+    }
+
+    #[test]
+    fn toml_subset() {
+        let t = parse("a = 'C:\\raw'  # literal: no escapes\nb = \"x\\ty\\u00e9\"\nn = 1_000\nf = -1.5\nyes = true\nlist = [\n  \"x\", # first\n  'y',\n]\n[t]\n\"quoted key\" = 2").unwrap();
+        let top = &t[0];
+        assert_eq!(top.str("a").as_deref(), Some(r"C:\raw"));
+        assert_eq!(top.str("b").as_deref(), Some("x\tyé"));
+        assert_eq!((top.num("n"), top.num("f")), (Some(1000.0), Some(-1.5)));
+        assert_eq!(top.get("yes"), Some(&Val::Bool(true)));
+        assert_eq!(top.strs("list"), ["x", "y"], "multi-line, comments and a trailing comma");
+        assert_eq!((t[1].name.as_str(), t[1].num("quoted key")), ("t", Some(2.0)));
+        assert_eq!(top.num("a"), None, "wrong type: ignored");
+        assert_eq!(parse("\u{feff}# saved by Notepad\nx = 1").unwrap()[0].num("x"), Some(1.0), "byte order mark skipped");
+
+        let err = |s: &str| parse(s).err().unwrap();
+        assert_eq!(err("a = 1\nb = \"open"), "line 2: unterminated string");
+        assert!(err("x = {a = 1}").contains("inline tables"));
+        assert!(err("a.b = 1").contains("dotted keys"));
+        assert!(err("p = \"D:\\work\"").contains("unknown escape"), "a Windows path in double quotes needs \\\\");
+        assert!(err("a = 1 2").contains("after the value"));
+        assert!(err("[x").contains("expected ]"));
     }
 
     #[test]
     fn parse_and_override() {
         assert_eq!(hex("#1e1e1e"), Some(0x1e1e1e));
         assert_eq!(hex("zzz"), None);
-        let c: Config = toml::from_str("theme=\"Friendly\"\n[dark]\nbackground=\"#101010\"\nansi=[\"#ff0000\"]\n[[panel]]\nname=\"a\"\ncmd=\"claude\"").unwrap();
+        let c = parse_config("theme=\"Friendly\"\n[dark]\nbackground=\"#101010\"\nansi=[\"#ff0000\"]\n[[panel]]\nname=\"a\"\ncmd=\"claude\"").unwrap();
         let [l, d, f] = c.themes();
         assert_eq!((d.bg, d.ansi[0], d.ansi[1]), (0x101010, 0xff0000, Theme::dark().ansi[1]));
         assert_eq!((l.bg, f.bg), (Theme::light().bg, Theme::friendly().bg));
@@ -380,7 +726,7 @@ mod tests {
         snap.snap = true;
         assert_eq!(snap.rgb(Color::Rgb(0xd77757)), snap.ansi[1], "on: Claude's orange becomes the theme's red");
         assert_eq!(snap.rgb(Color::Rgb(0x141414)), snap.bg, "a near-black tint becomes the background");
-        let t: Config = toml::from_str(TEMPLATE).unwrap(); // the shipped template must parse
+        let t = parse_config(TEMPLATE).unwrap(); // the shipped template must parse
         assert_eq!(t.theme, "light");
         assert_eq!((t.font_size, t.line_height, t.letter_spacing), (Some(100.0), Some(0.0), Some(0.0)));
 
@@ -388,7 +734,7 @@ mod tests {
         let keys = [("font_size", "110".to_string()), ("letter_spacing", "0.5".to_string())];
         let out = set_keys("theme = \"dark\"\nfont_size = 100  # percent\n# letter_spacing = 9\n[[panel]]\nname = \"a\"\n", &keys);
         assert_eq!(out, "theme = \"dark\"\nfont_size = 110  # percent\n# letter_spacing = 9\nletter_spacing = 0.5\n[[panel]]\nname = \"a\"\n");
-        let c: Config = toml::from_str(&out).unwrap();
+        let c = parse_config(&out).unwrap();
         assert_eq!((c.font_size, c.letter_spacing, c.panel.len()), (Some(110.0), Some(0.5), 1));
 
         // legible: text on the surface keeps a comfortable contrast in every theme

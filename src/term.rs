@@ -2,7 +2,6 @@
 //! ponytail: every char is 1 or 2 cells (combining marks dropped), no mouse reporting.
 
 use std::collections::VecDeque;
-use unicode_width::UnicodeWidthChar;
 
 const HISTORY_MAX: usize = 10_000;
 
@@ -41,6 +40,30 @@ enum State {
     OscEsc,
 }
 
+/// Which mouse events the program wants reported, each level including the ones before it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Mouse {
+    Off,
+    /// presses, releases and the wheel (1000)
+    Click,
+    /// also motion while a button is held (1002)
+    Drag,
+    /// also any motion (1003)
+    Motion,
+}
+
+/// What happened to the mouse, for `Term::mouse_report`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseEv {
+    /// button 0 left, 1 middle, 2 right
+    Press(u8),
+    Release(u8),
+    /// the pointer moved; the button held, if any
+    Move(Option<u8>),
+    WheelUp,
+    WheelDown,
+}
+
 pub struct Term {
     pub cols: usize,
     pub rows: usize,
@@ -52,6 +75,14 @@ pub struct Term {
     pub cursor_visible: bool,
     pub app_cursor: bool,
     pub bracketed_paste: bool,
+    /// Mouse reporting the program asked for (DECSET 1000/1002/1003); while it is on, the program owns the mouse.
+    pub mouse: Mouse,
+    /// Mouse reports in SGR form (DECSET 1006), else the legacy `CSI M` bytes.
+    pub mouse_sgr: bool,
+    /// Report focus in and out as `CSI I` / `CSI O` (DECSET 1004).
+    pub focus_events: bool,
+    /// When the grid last resized: ConPTY repaints with `2J 3J` right after, which must not wipe the scrollback.
+    resized_at: Option<std::time::Instant>,
     /// Working directory reported by the shell (OSC 7 / OSC 9;9).
     pub cwd: Option<String>,
     /// Where the shell's last prompt starts (OSC 133;A): (absolute line, col). Cleared by the caller once a command is sent.
@@ -213,6 +244,10 @@ impl Term {
             cursor_visible: true,
             app_cursor: false,
             bracketed_paste: false,
+            mouse: Mouse::Off,
+            mouse_sgr: false,
+            focus_events: false,
+            resized_at: None,
             cwd: None,
             prompt: None,
             history: VecDeque::new(),
@@ -319,6 +354,11 @@ impl Term {
         l
     }
 
+    /// A full-screen program is up.
+    pub fn alt_screen(&self) -> bool {
+        self.alt.is_some()
+    }
+
     /// The shell is waiting at its prompt: the cursor's line is the one the last prompt started.
     pub fn at_prompt(&self) -> bool {
         self.alt.is_none() && self.prompt.is_some_and(|(l, _)| l == self.line_start())
@@ -380,11 +420,35 @@ impl Term {
         Some(chars[s..e].iter().collect())
     }
 
+    // ---- mouse ----
+
+    /// The bytes reporting `ev` at cell (`col`, `row`) of the screen, or None when the program did not ask for it.
+    /// `mods`: shift 4, alt 8, ctrl 16, as xterm adds them to the button code.
+    pub fn mouse_report(&self, ev: MouseEv, col: usize, row: usize, mods: u8) -> Option<Vec<u8>> {
+        let (code, release) = match ev {
+            _ if self.mouse == Mouse::Off => return None,
+            MouseEv::Press(b) => (b, false),
+            MouseEv::Release(b) => (if self.mouse_sgr { b } else { 3 }, true), // legacy releases do not say which button
+            MouseEv::Move(b) if self.mouse == Mouse::Motion || (self.mouse == Mouse::Drag && b.is_some()) => (32 + b.unwrap_or(3), false),
+            MouseEv::Move(_) => return None,
+            MouseEv::WheelUp => (64, false),
+            MouseEv::WheelDown => (65, false),
+        };
+        let code = code + mods;
+        if self.mouse_sgr {
+            return Some(format!("[<{code};{};{}{}", col + 1, row + 1, if release { 'm' } else { 'M' }).into_bytes());
+        }
+        // legacy: each value plus 32 in one byte, so a cell past column/row 223 cannot be reported
+        let (x, y) = (u8::try_from(col + 33).ok().filter(|&v| v < 255)?, u8::try_from(row + 33).ok().filter(|&v| v < 255)?);
+        Some(vec![0x1b, b'[', b'M', 32 + code, x, y])
+    }
+
     // ---- resize ----
 
     /// The main screen and its history rewrap to the new width (see `rewrap`); the alternate screen is just cropped.
     /// ponytail: Windows ConPTY also repaints the screen after a resize; that repaint lands on the rewrapped grid.
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.resized_at = Some(std::time::Instant::now());
         if let Some((cells, wrapped, pos)) = &mut self.alt {
             (*cells, *wrapped, *pos) = rewrap(&mut self.history, cells, wrapped, *pos, self.cols, cols, rows);
             self.cells = crop(&self.cells, self.cols, self.rows, cols, rows);
@@ -431,7 +495,14 @@ impl Term {
                     self.wrap_pending = false;
                 }
                 0x09 => self.cx = ((self.cx / 8 + 1) * 8).min(self.cols - 1),
-                0x0a..=0x0c => self.linefeed(),
+                0x0a..=0x0c => {
+                    self.linefeed();
+                    // ConPTY passes OSC 133;A through ahead of text it has not drawn yet (the echoed command and
+                    // its newline): a newline after the prompt mark is that stale text, so the prompt is below it
+                    if self.prompt.is_some() {
+                        self.prompt = Some((self.history.len() + self.cy, 0));
+                    }
+                }
                 0x0d => {
                     self.cx = 0;
                     self.wrap_pending = false;
@@ -546,9 +617,9 @@ impl Term {
     }
 
     fn put(&mut self, ch: char) {
-        let w = match ch.width() {
-            Some(0) | None => return, // ponytail: combining marks dropped
-            Some(w) => w.min(2).min(self.cols),
+        let w = match crate::width::width(ch) {
+            0 => return, // ponytail: combining marks dropped
+            w => w.min(self.cols),
         };
         if self.wrap_pending || self.cx + w > self.cols {
             self.wrapped[self.cy] = true;
@@ -664,6 +735,16 @@ impl Term {
                         25 => self.cursor_visible = on,
                         1 => self.app_cursor = on,
                         2004 => self.bracketed_paste = on,
+                        1000 | 1002 | 1003 => {
+                            let m = match m { 1000 => Mouse::Click, 1002 => Mouse::Drag, _ => Mouse::Motion };
+                            if on {
+                                self.mouse = m;
+                            } else if self.mouse == m {
+                                self.mouse = Mouse::Off;
+                            }
+                        }
+                        1006 => self.mouse_sgr = on,
+                        1004 => self.focus_events = on,
                         47 | 1047 | 1049 => self.set_alt(on),
                         _ => {}
                     }
@@ -691,6 +772,17 @@ impl Term {
             b'J' => match p[0] {
                 0 => self.fill(i, cols * rows),
                 1 => self.fill(0, i + 1),
+                // erase saved lines (`clear`, `cls`). Ignored while a TUI that asked for focus events is running, and
+                // for a moment after a resize: Claude Code and ConPTY send `2J 3J` on every full repaint, i.e. on
+                // each resize and focus change, which would wipe the scrollback for good
+                3 => {
+                    let settled = self.resized_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(1500));
+                    if self.alt.is_none() && !self.focus_events && settled {
+                        self.history.clear();
+                        self.scroll = 0;
+                        self.prompt = None;
+                    }
+                }
                 _ => self.fill(0, cols * rows),
             },
             b'K' => match p[0] {
@@ -856,6 +948,12 @@ mod tests {
         assert_eq!(t.scroll, 2); // clamped
         t.feed(b"\r\ne"); // output while scrolled back keeps the place
         assert_eq!(t.line(t.view_start())[0].ch, 'a');
+        t.resized_at = Some(std::time::Instant::now());
+        t.feed(b"\x1b[3J"); // a repaint right after a resize: scrollback and screen both kept
+        assert_eq!((t.history.len(), t.dump().as_str()), (3, "d\ne"));
+        t.resized_at = None;
+        t.feed(b"\x1b[2J\x1b[3J"); // `clear`: the scrollback goes too
+        assert_eq!((t.history.len(), t.scroll), (0, 0));
     }
 
     #[test]
@@ -897,8 +995,10 @@ mod tests {
         let mut t = Term::new(6, 3);
         t.feed(b"out\r\n\x1b]133;A\x07   abcdefgh"); // prompt on row 1, the typed text wraps
         assert!(t.prompt == Some((1, 0)) && t.at_prompt(), "the cursor is on the wrapped row of the prompt's line");
-        t.feed(b"\r\n\r\n"); // scrolls: the absolute line stays the same
-        assert!(t.prompt == Some((1, 0)) && !t.at_prompt(), "output moved on: no longer at the prompt");
+
+        let mut t = Term::new(10, 2);
+        t.feed(b"   \x1b]133;A\x07dir\r\nfile\r\n   "); // ConPTY: the marker came before the last command's echo and output
+        assert!(t.prompt == Some((2, 0)) && t.at_prompt(), "the prompt is on the line after them (scrolled)");
 
         let mut t = Term::new(6, 3);
         t.feed(b"\x1b]133;A\x07   abcdefgh"); // cursor on the wrapped second row
@@ -960,5 +1060,62 @@ mod tests {
         assert_eq!(t.dump(), "zz\n\n\n");
         t.feed(b"\x1b[?1049l");
         assert_eq!(t.dump(), "abc\ndef\ngh\n");
+    }
+
+    #[test]
+    fn mouse_reports_follow_the_modes_asked_for() {
+        let mut t = Term::new(10, 3);
+        assert_eq!(t.mouse_report(MouseEv::WheelUp, 0, 0, 0), None, "off until the program asks");
+        t.feed(b"[?1000h[?1006h[?1004h");
+        assert!(t.focus_events);
+        let r = |t: &Term, ev, m| t.mouse_report(ev, 4, 1, m).map(|b| String::from_utf8(b).unwrap());
+        assert_eq!(r(&t, MouseEv::WheelUp, 0).as_deref(), Some("[<64;5;2M"));
+        assert_eq!(r(&t, MouseEv::WheelDown, 16).as_deref(), Some("[<81;5;2M"), "ctrl");
+        assert_eq!(r(&t, MouseEv::Press(0), 0).as_deref(), Some("[<0;5;2M"));
+        assert_eq!(r(&t, MouseEv::Release(0), 0).as_deref(), Some("[<0;5;2m"));
+        assert_eq!(r(&t, MouseEv::Move(Some(0)), 0), None, "1000 reports no motion");
+        t.feed(b"[?1002h");
+        assert_eq!(r(&t, MouseEv::Move(Some(0)), 0).as_deref(), Some("[<32;5;2M"));
+        assert_eq!(r(&t, MouseEv::Move(None), 0), None, "1002: only while a button is held");
+        t.feed(b"[?1003h");
+        assert_eq!(r(&t, MouseEv::Move(None), 0).as_deref(), Some("[<35;5;2M"));
+        t.feed(b"[?1006l");
+        assert_eq!(t.mouse_report(MouseEv::Release(0), 4, 1, 0), Some(b"[M#%\"".to_vec()), "legacy bytes");
+        t.feed(b"[?1003l[?1004l");
+        assert_eq!((t.mouse, t.focus_events), (Mouse::Off, false));
+        t.feed(b"[?1000hc");
+        assert_eq!(t.mouse, Mouse::Off, "a reset turns it off");
+    }
+
+    /// Replays a `MAULA_RECORD` file and prints every place the history shrank, with the bytes just before it:
+    /// `MAULA_REPLAY=dir/pane-0.out cargo test replay -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replay() {
+        let data = std::fs::read(std::env::var("MAULA_REPLAY").expect("MAULA_REPLAY=<file>")).unwrap();
+        let mark = b"\x1b_maula-resize;";
+        let mut t = Term::new(80, 24);
+        let (mut i, mut max) = (0, 0);
+        while i < data.len() {
+            if data[i..].starts_with(mark) {
+                let end = i + data[i..].windows(2).position(|w| w == b"\x1b\\").unwrap();
+                let s = std::str::from_utf8(&data[i + mark.len()..end]).unwrap();
+                let (c, r) = s.split_once(';').unwrap();
+                let before = t.history.len();
+                t.resize(c.parse().unwrap(), r.parse().unwrap());
+                println!("@{i}: resize {s}  history {before} -> {}", t.history.len());
+                i = end + 2;
+                continue;
+            }
+            let before = t.history.len();
+            t.feed(&data[i..i + 1]);
+            max = max.max(t.history.len());
+            if t.history.len() < before {
+                let ctx = String::from_utf8_lossy(&data[i.saturating_sub(120)..=i]).escape_debug().to_string();
+                println!("@{i}: history {before} -> {}  after: {ctx}", t.history.len());
+            }
+            i += 1;
+        }
+        println!("end: history {} (max {max}), alt screen {}", t.history.len(), t.alt.is_some());
     }
 }
