@@ -215,7 +215,14 @@ pub fn hex(s: &str) -> Option<u32> {
 pub struct SavedSpace {
     pub name: String,
     pub dirs: Vec<String>,
+    pub notes: Vec<String>, // the notepad text of each terminal, in the order of `dirs`
+    pub note_styles: Vec<String>, // the notepad's character styles ("start-end:biu:hl;..."), per terminal; may be shorter than `dirs`
+    pub note_size: Vec<f32>,      // the notepad's font size (14: the default), per terminal
+    pub note_line: Vec<f32>,      // the notepad's line height, times the font's own (1: the default), per terminal
 }
+
+/// The notepad's default font size (what `note_size` holds when nothing was chosen).
+pub const NOTE_SIZE_DEFAULT: f32 = 14.0;
 
 fn spaces_path() -> PathBuf {
     config_dir().join("spaces.toml")
@@ -273,6 +280,12 @@ impl Table {
         match self.get(key)? {
             Val::Num(n) => Some(*n as f32),
             _ => None,
+        }
+    }
+    fn nums(&self, key: &str) -> Vec<f32> {
+        match self.get(key) {
+            Some(Val::Arr(a)) => a.iter().filter_map(|v| if let Val::Num(n) = v { Some(*n as f32) } else { None }).collect(),
+            _ => Vec::new(),
         }
     }
     fn strs(&self, key: &str) -> Vec<String> {
@@ -519,14 +532,30 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
 }
 
 fn spaces_from_toml(text: &str) -> Result<Vec<SavedSpace>, String> {
-    Ok(parse(text)?.iter().filter(|t| t.name == "space").map(|t| SavedSpace { name: t.str("name").unwrap_or_default(), dirs: t.strs("dirs") }).collect())
+    Ok(parse(text)?.iter().filter(|t| t.name == "space").map(|t| SavedSpace { name: t.str("name").unwrap_or_default(), dirs: t.strs("dirs"), notes: t.strs("notes"), note_styles: t.strs("note_styles"), note_size: t.nums("note_size"), note_line: t.nums("note_line") }).collect())
 }
 
 fn spaces_to_toml(list: &[SavedSpace]) -> String {
     let mut out = String::new();
     for s in list {
         let dirs: Vec<String> = s.dirs.iter().map(|d| quoted(d)).collect();
-        out += &format!("[[space]]\nname = {}\ndirs = [{}]\n\n", quoted(&s.name), dirs.join(", "));
+        out += &format!("[[space]]\nname = {}\ndirs = [{}]\n", quoted(&s.name), dirs.join(", "));
+        // the notepad keys are left out while there is nothing to keep; a file without them still loads
+        let strs = |v: &[String]| v.iter().map(|n| quoted(n)).collect::<Vec<_>>().join(", ");
+        let nums = |v: &[f32]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+        if s.notes.iter().any(|n| !n.is_empty()) {
+            out += &format!("notes = [{}]\n", strs(&s.notes));
+        }
+        if s.note_styles.iter().any(|n| !n.is_empty()) {
+            out += &format!("note_styles = [{}]\n", strs(&s.note_styles));
+        }
+        if s.note_size.iter().any(|&n| n != NOTE_SIZE_DEFAULT) {
+            out += &format!("note_size = [{}]\n", nums(&s.note_size));
+        }
+        if s.note_line.iter().any(|&n| n != 1.0) {
+            out += &format!("note_line = [{}]\n", nums(&s.note_line));
+        }
+        out.push('\n');
     }
     out
 }
@@ -629,7 +658,7 @@ mod tests {
 
     #[test]
     fn saved_spaces_round_trip_and_replace_by_name() {
-        let space = |name: &str, dirs: &[&str]| SavedSpace { name: name.into(), dirs: dirs.iter().map(|d| d.to_string()).collect() };
+        let space = |name: &str, dirs: &[&str]| SavedSpace { name: name.into(), dirs: dirs.iter().map(|d| d.to_string()).collect(), ..Default::default() };
         let mut list = vec![];
         upsert(&mut list, space("api", &["D:/a", "D:/b"]));
         upsert(&mut list, space("web", &["D:/w"]));
@@ -639,6 +668,24 @@ mod tests {
         let text = spaces_to_toml(&list);
         assert_eq!(spaces_from_toml(&text).unwrap(), list, "quotes, backslashes, tabs and non-ASCII survive");
         assert!(spaces_from_toml("").unwrap().is_empty(), "no file content: no spaces");
+    }
+
+    #[test]
+    fn saved_notes_keep_their_styles_size_and_line_height() {
+        let rich = SavedSpace {
+            name: "w".into(),
+            dirs: vec!["D:/a".into(), "D:/b".into()],
+            notes: vec!["line one\n\"two\" \\ \u{4e2d}".into(), String::new()],
+            note_styles: vec!["0-4:bi;5-8::2".into(), String::new()],
+            note_size: vec![18.0, 14.0],
+            note_line: vec![1.5, 1.0],
+        };
+        let plain = SavedSpace { name: "p".into(), dirs: vec!["D:/c".into()], ..Default::default() };
+        let text = spaces_to_toml(&[rich.clone(), plain.clone()]);
+        assert_eq!(spaces_from_toml(&text).unwrap(), [rich, plain.clone()]);
+        assert!(!spaces_to_toml(&[plain]).contains("note"), "nothing to keep: no notepad keys");
+        let old = spaces_from_toml("[[space]]\nname = \"old\"\ndirs = [\"D:/x\"]\n").unwrap();
+        assert!(old[0].note_styles.is_empty() && old[0].note_size.is_empty(), "files from before styles still load");
     }
 
     #[test]

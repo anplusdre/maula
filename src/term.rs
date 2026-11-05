@@ -81,6 +81,8 @@ pub struct Term {
     pub mouse_sgr: bool,
     /// Report focus in and out as `CSI I` / `CSI O` (DECSET 1004).
     pub focus_events: bool,
+    /// When the grid last resized: ConPTY repaints with `2J 3J` right after, which must not wipe the scrollback.
+    resized_at: Option<std::time::Instant>,
     /// Working directory reported by the shell (OSC 7 / OSC 9;9).
     pub cwd: Option<String>,
     /// Where the shell's last prompt starts (OSC 133;A): (absolute line, col). Cleared by the caller once a command is sent.
@@ -245,6 +247,7 @@ impl Term {
             mouse: Mouse::Off,
             mouse_sgr: false,
             focus_events: false,
+            resized_at: None,
             cwd: None,
             prompt: None,
             history: VecDeque::new(),
@@ -445,6 +448,7 @@ impl Term {
     /// The main screen and its history rewrap to the new width (see `rewrap`); the alternate screen is just cropped.
     /// ponytail: Windows ConPTY also repaints the screen after a resize; that repaint lands on the rewrapped grid.
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.resized_at = Some(std::time::Instant::now());
         if let Some((cells, wrapped, pos)) = &mut self.alt {
             (*cells, *wrapped, *pos) = rewrap(&mut self.history, cells, wrapped, *pos, self.cols, cols, rows);
             self.cells = crop(&self.cells, self.cols, self.rows, cols, rows);
@@ -768,9 +772,17 @@ impl Term {
             b'J' => match p[0] {
                 0 => self.fill(i, cols * rows),
                 1 => self.fill(0, i + 1),
-                // erase saved lines: ignored. TUIs (Claude Code, via ConPTY) send `2J 3J` on every full repaint,
-                // i.e. on each resize and focus change, which would wipe the scrollback for good
-                3 => {}
+                // erase saved lines (`clear`, `cls`). Ignored while a TUI that asked for focus events is running, and
+                // for a moment after a resize: Claude Code and ConPTY send `2J 3J` on every full repaint, i.e. on
+                // each resize and focus change, which would wipe the scrollback for good
+                3 => {
+                    let settled = self.resized_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(1500));
+                    if self.alt.is_none() && !self.focus_events && settled {
+                        self.history.clear();
+                        self.scroll = 0;
+                        self.prompt = None;
+                    }
+                }
                 _ => self.fill(0, cols * rows),
             },
             b'K' => match p[0] {
@@ -936,8 +948,12 @@ mod tests {
         assert_eq!(t.scroll, 2); // clamped
         t.feed(b"\r\ne"); // output while scrolled back keeps the place
         assert_eq!(t.line(t.view_start())[0].ch, 'a');
-        t.feed(b"\x1b[3J"); // a TUI repainting: scrollback and screen both kept
+        t.resized_at = Some(std::time::Instant::now());
+        t.feed(b"\x1b[3J"); // a repaint right after a resize: scrollback and screen both kept
         assert_eq!((t.history.len(), t.dump().as_str()), (3, "d\ne"));
+        t.resized_at = None;
+        t.feed(b"\x1b[2J\x1b[3J"); // `clear`: the scrollback goes too
+        assert_eq!((t.history.len(), t.scroll), (0, 0));
     }
 
     #[test]

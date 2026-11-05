@@ -39,6 +39,11 @@ pub fn hook_main() {
     let (Some(pane), Some(port), Some(token)) = (var("MAULA_PANE"), var("MAULA_PORT"), var("MAULA_TOKEN")) else { return };
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    if input.contains("\"SessionStart\"") {
+        if let Some(h) = crate::notes_api::session_hint() {
+            println!("{}", crate::notes_api::hint_json(&h)); // tells the session about `maula note`
+        }
+    }
     let Ok(port) = port.parse::<u16>() else { return };
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
