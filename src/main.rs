@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use suggest::Suggest;
-use term::{Mouse, MouseEv, Term, BLANK};
+use term::{Cell, Color, Mouse, MouseEv, Term, BLANK};
 use window::{Control, CursorIcon, ElementState, Event, Key, KeyEvent, ModifiersState, MouseButton, MouseScrollDelta, NamedKey, ResizeDirection, Window};
 use std::{
     collections::HashMap,
@@ -40,7 +40,7 @@ const SPACE_SIZE: usize = 2; // terminals per space
 
 /// Dropdown rows, in order: the themes (`THEME_NAMES` order) and Accent, then view (space, grid, carousel) and
 /// Maximize, then the Text submenus (`TEXT_ROWS` order), then Claude. `MENU_GROUPS`: how many rows each group has.
-const MENU_ACTIONS: [Action; 13] = [
+const MENU_ACTIONS: [Action; 14] = [
     Action::SetTheme(0),
     Action::SetTheme(1),
     Action::SetTheme(2),
@@ -53,19 +53,21 @@ const MENU_ACTIONS: [Action; 13] = [
     Action::SubMenu(1),
     Action::SubMenu(2),
     Action::SubMenu(3),
+    Action::SubMenu(6),
     Action::InstallHooks,
 ];
-const MENU_GROUPS: [(&str, usize); 4] = [("Theme", 4), ("View", 4), ("Text", 4), ("Claude", 1)];
+const MENU_GROUPS: [(&str, usize); 4] = [("Theme", 4), ("View", 4), ("Text", 4), ("Claude", 2)];
 
 /// The dropdown's submenu rows. The Text group (the first four) applies to the terminal and the header titles;
-/// Accent sits in the Theme group, Maximize in the View group.
-const TEXT_ROWS: [&str; 6] = ["Font", "Size", "Line height", "Letter spacing", "Accent", "Maximize"];
+/// Accent sits in the Theme group, Maximize in the View group, Render in the Claude group.
+const TEXT_ROWS: [&str; 7] = ["Font", "Size", "Line height", "Letter spacing", "Accent", "Maximize", "Render"];
 const SIZES: [f32; 6] = [85.0, 90.0, 100.0, 110.0, 125.0, 150.0]; // percent of FONT_PX / TITLE_PX
 const LINES: [f32; 5] = [0.0, 1.2, 1.4, 1.6, 1.8]; // terminal row height, times the font size; 0 = the font's own (~1.32)
 const TRACKS: [f32; 5] = [0.0, 0.5, 1.0, 1.5, 2.0]; // letter-spacing, design px
 const ACCENTS: [(&str, u32); 6] = [("Default", 0), ("Terracotta", 0xd97757), ("Blue", 0x4f86d9), ("Teal", 0x2a9d8f), ("Violet", 0x8b6fd6), ("Rose", 0xd9577f)];
 const MAXIMIZE: [&str; 2] = ["Borderless fullscreen", "Maximized window"]; // saved as "fullscreen" / "window"
-const TEXT_DEFAULT: [usize; 6] = [0, 2, 0, 0, 0, 0]; // chosen index per TEXT_ROWS entry
+const RENDER: [&str; 2] = ["Terminal", "Software"]; // how panels running Claude draw; saved in lower case
+const TEXT_DEFAULT: [usize; 7] = [0, 2, 0, 0, 0, 0, 0]; // chosen index per TEXT_ROWS entry
 
 /// Labels of the choices in Text submenu `k`.
 fn text_choices(k: usize) -> Vec<String> {
@@ -75,16 +77,18 @@ fn text_choices(k: usize) -> Vec<String> {
         2 => LINES.iter().map(|&l| if l == 0.0 { "Default".into() } else { format!("{l}") }).collect(),
         4 => ACCENTS.iter().map(|a| a.0.into()).collect(),
         5 => MAXIMIZE.iter().map(|&m| m.into()).collect(),
+        6 => RENDER.iter().map(|&r| r.into()).collect(),
         _ => TRACKS.iter().map(|t| format!("{t}px")).collect(),
     }
 }
 
 /// The Text choices saved in the config; a missing value, or one not on the menu, is the default.
-fn text_of(cfg: &Config) -> [usize; 6] {
+fn text_of(cfg: &Config) -> [usize; 7] {
     let at = |list: &[f32], v: Option<f32>, k: usize| v.and_then(|v| list.iter().position(|&x| x == v)).unwrap_or(TEXT_DEFAULT[k]);
     let accent = ACCENTS.iter().position(|a| a.0.eq_ignore_ascii_case(&cfg.accent)).unwrap_or(0);
     let window = usize::from(cfg.maximize.eq_ignore_ascii_case("window"));
-    [0, at(&SIZES, cfg.font_size, 1), at(&LINES, cfg.line_height, 2), at(&TRACKS, cfg.letter_spacing, 3), accent, window]
+    let software = usize::from(cfg.render.eq_ignore_ascii_case("software"));
+    [0, at(&SIZES, cfg.font_size, 1), at(&LINES, cfg.line_height, 2), at(&TRACKS, cfg.letter_spacing, 3), accent, window, software]
 }
 
 /// `t` with Accent choice `i` as its accent (and cursor); 0 keeps the theme's own.
@@ -97,10 +101,12 @@ fn with_accent(mut t: Theme, i: usize) -> Theme {
     t
 }
 
-/// Terminal and title fonts for the Text choices `text` (see `TEXT_DEFAULT`).
-fn text_fonts(text: [usize; 6], scale: f32) -> (Font, Font) {
+/// Terminal, title and running-text fonts for the Text choices `text` (see `TEXT_DEFAULT`).
+fn text_fonts(text: [usize; 7], scale: f32) -> (Font, Font, Font) {
     let (k, track) = (SIZES[text[1]] / 100.0 * scale, TRACKS[text[3]] * scale);
-    (Font::new(FONT_PX * k).spaced(LINES[text[2]], track), Font::medium(TITLE_PX * k).spaced(0.0, track))
+    let mono = Font::new(FONT_PX * k).spaced(LINES[text[2]], track);
+    let prose = Font::prose(FONT_PX * k, mono.ascent);
+    (mono, Font::medium(TITLE_PX * k).spaced(0.0, track), prose)
 }
 
 /// Replaces the user's PowerShell prompt with three blank cells, where maula draws the prompt mark (the panel header
@@ -226,6 +232,12 @@ struct Pane {
 }
 
 impl Pane {
+    /// Draw this panel with the Software render: chosen in the dropdown, Claude runs here (hooks report it), and it is
+    /// on its classic renderer. A full-screen program places every cell itself, so that stays a grid.
+    fn software(&self, text: [usize; 7]) -> bool {
+        text[6] == 1 && self.claude.is_some() && self.term.mouse == Mouse::Off && !self.term.alt_screen()
+    }
+
     /// Where the shell is: what it last reported, else where it started.
     fn cwd(&self) -> Option<PathBuf> {
         self.term.cwd.as_ref().map(PathBuf::from).or_else(|| self.dir.clone()).or_else(|| std::env::current_dir().ok())
@@ -253,7 +265,7 @@ fn spawn_pty(proxy: &Proxy, id: usize, shell: Option<&str>, dir: Option<&Path>, 
     let (exe, args, mut env) = shell_command(shell);
     // Claude Code keeps its classic renderer here: its full-screen one draws on an alternate screen with its own
     // scrollback, which leaves maula's scrollback, scrollbar, search and selection with nothing to work on.
-    // Wins over Claude's `tui` setting and its full-screen trials; only shells started by maula get it.
+    // Only shells started by maula get it. A `/tui fullscreen` typed in Claude still switches: it relaunches itself past this.
     env.push(("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1".to_string()));
     if let Some((port, token)) = ipc {
         env.extend([("MAULA_PANE", id.to_string()), ("MAULA_PORT", port.to_string()), ("MAULA_TOKEN", token.clone())]);
@@ -338,6 +350,7 @@ struct Ui {
     window: Window,
     hwnd: isize, // the window, for presenting frames and owning the clipboard
     font: Font,    // terminal (monospace)
+    prose: Font,   // running text in the Software render (proportional)
     ui_font: Font, // dropdown, popups
     title_font: Font, // panel titles
     icon_font: Font, // Lucide, sized to ICON
@@ -379,7 +392,7 @@ struct Ui {
     menu_sel: Option<usize>,            // highlighted dropdown row (hover or keyboard)
     sub: Option<usize>,                 // open Text submenu
     sub_sel: Option<usize>,             // highlighted row of it
-    text: [usize; 6],                   // submenu choices, see TEXT_DEFAULT
+    text: [usize; 7],                   // submenu choices, see TEXT_DEFAULT
     picker: Option<Picker>,             // folder / drive picker of a panel header; modal like the dropdown
     pick_scroll: f32,                   // wheel distance not yet worth a row
     pick_rehover: bool,                 // the wheel scrolled the picker: the highlight must follow the row under the pointer
@@ -402,7 +415,7 @@ impl Ui {
     fn new(window: Window, proxy: Proxy, cfg: Config) -> Ui {
         let scale = window.scale_factor() as f32;
         let text = text_of(&cfg);
-        let ((font, title_font), ui_font) = (text_fonts(text, scale), Font::new(UI_PX * scale));
+        let ((font, title_font, prose), ui_font) = (text_fonts(text, scale), Font::new(UI_PX * scale));
         let (icon_font, close_font) = (Font::icons(ICON * scale), Font::medium(CLOSE_PX * scale));
         let hwnd = window.hwnd;
         let p = proxy.clone();
@@ -413,6 +426,7 @@ impl Ui {
             window,
             hwnd,
             font,
+            prose,
             ui_font,
             title_font,
             icon_font,
@@ -926,7 +940,7 @@ impl Ui {
             View::Grid => "grid",
             View::Cards => "carousel",
         };
-        let [font, size, line, track, accent, window] = self.text;
+        let [font, size, line, track, accent, window, render] = self.text;
         config::save(&[
             ("theme", format!("{:?}", THEME_NAMES[self.theme].to_lowercase())),
             ("view", format!("{view:?}")),
@@ -936,6 +950,7 @@ impl Ui {
             ("letter_spacing", TRACKS[track].to_string()),
             ("accent", format!("{:?}", ACCENTS[accent].0.to_lowercase())),
             ("maximize", format!("{:?}", ["fullscreen", "window"][window])),
+            ("render", format!("{:?}", RENDER[render].to_lowercase())),
         ]);
     }
 
@@ -1020,7 +1035,7 @@ impl Ui {
                 self.text[k] = i;
                 self.save_config();
                 (self.menu_open, self.menu_sel, self.sub) = (false, None, None);
-                (self.font, self.title_font) = text_fonts(self.text, self.scale);
+                (self.font, self.title_font, self.prose) = text_fonts(self.text, self.scale);
                 self.relayout();
             }
             Action::ToggleMenu => {
@@ -1409,11 +1424,18 @@ impl Ui {
         true
     }
 
-    fn cell_at(&self, i: usize, inner: Rect, x: i32, y: i32) -> Pos {
-        let t = &self.panes[i].term;
-        let col = ((x - inner.x) / self.font.cw).clamp(0, t.cols as i32 - 1) as usize;
+    fn cell_at(&mut self, i: usize, inner: Rect, x: i32, y: i32) -> Pos {
+        let p = &self.panes[i];
+        let t = &p.term;
         let row = ((y - inner.y) / self.font.ch).clamp(0, t.rows as i32 - 1) as usize;
-        ((t.history.len() as f32 - self.panes[i].scroll_pos).round() as usize + row, col)
+        let line = (t.history.len() as f32 - p.scroll_pos).round() as usize + row;
+        let dx = x - inner.x;
+        let xs = if p.software(self.text) { prose_xs(&mut self.prose, self.font.cw, t.line(line), t.cols) } else { None };
+        let col = match xs {
+            Some(xs) => xs.partition_point(|&e| e <= dx).saturating_sub(1).min(t.cols - 1),
+            None => (dx / self.font.cw).clamp(0, t.cols as i32 - 1) as usize,
+        };
+        (line, col)
     }
 
     fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
@@ -1579,10 +1601,36 @@ impl Ui {
         }
         let Some(i) = self.drag else { return };
         let Some((_, outer, inner)) = self.slots().into_iter().find(|s| s.0 == i) else { return };
-        let head = self.cell_at(i, inner, x, y);
+        self.extend_sel(i, inner);
+        self.invalidate_rect(outer);
+        if !self.animating && edge_speed(y, inner, self.font.ch) != 0.0 {
+            self.start_animating(); // past the edge: `tick` keeps scrolling while the pointer rests there
+        }
+    }
+
+    /// Moves the end of pane `i`'s drag selection to the cell under the pointer.
+    fn extend_sel(&mut self, i: usize, inner: Rect) {
+        let head = self.cell_at(i, inner, self.mouse.0, self.mouse.1);
         let p = &mut self.panes[i];
         p.sel = if head != p.anchor { Some((p.anchor, head)) } else { None };
-        self.invalidate_rect(outer);
+    }
+
+    /// Dragging a selection past the top or bottom of the text scrolls the view, so a selection can run beyond what
+    /// is on screen. Returns the pane while it can still move.
+    fn edge_scroll(&mut self, dt: f32) -> Option<usize> {
+        let i = self.drag?;
+        let (_, _, inner) = self.slots().into_iter().find(|s| s.0 == i)?;
+        let speed = edge_speed(self.mouse.1, inner, self.font.ch);
+        let p = &mut self.panes[i];
+        let max = p.term.history.len() as f32;
+        if speed == 0.0 || (speed > 0.0 && p.scroll_goal >= max) || (speed < 0.0 && p.scroll_goal <= 0.0) {
+            return None;
+        }
+        p.scroll_goal = (p.scroll_goal + speed * dt).clamp(0.0, max);
+        p.term.scroll = p.scroll_goal.round() as usize;
+        p.scroll_pos = p.scroll_goal; // no glide: the selection must follow the text exactly
+        self.extend_sel(i, inner);
+        Some(i)
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
@@ -1618,13 +1666,22 @@ impl Ui {
             return;
         }
         self.wheel_acc = 0.0;
-        if let Some((i, outer, _)) = self.hit_pane(self.mouse.0, self.mouse.1) {
+        // a drag selection keeps its panel even with the pointer outside it
+        let target = match self.drag {
+            Some(i) => self.slots().into_iter().find(|s| s.0 == i),
+            None => self.hit_pane(self.mouse.0, self.mouse.1),
+        };
+        if let Some((i, outer, inner)) = target {
+            let dragging = self.drag == Some(i);
             let p = &mut self.panes[i];
             // keep the fractional part: small touchpad deltas add up instead of being rounded away
             p.scroll_goal = (p.scroll_goal + dy).clamp(0.0, p.term.history.len() as f32);
             p.term.scroll = p.scroll_goal.round() as usize;
-            if fine {
-                p.scroll_pos = p.scroll_goal; // follow the fingers exactly
+            if fine || dragging {
+                p.scroll_pos = p.scroll_goal; // follow the fingers exactly; a selection must follow the text
+            }
+            if dragging {
+                self.extend_sel(i, inner); // the wheel carries a selection past the screen
             }
             return self.invalidate_rect(outer);
         }
@@ -1688,6 +1745,7 @@ impl Ui {
                 moving.push(i);
             }
         }
+        moving.extend(self.edge_scroll(dt));
         if !moving.is_empty() {
             let slots = self.slots();
             for i in &moving {
@@ -1732,7 +1790,7 @@ impl Ui {
         let tab_menu = self.smenu.map(|id| (id, self.smenu_sel, self.space_count(id)));
         let (hooks, focused, clock) = (self.hooks, self.focused, self.started.elapsed().as_secs_f32());
         let mut mark = None; // the live prompt mark's cell, if one is on screen
-        let Ui { hwnd, frame, font, ui_font: ui, title_font: titlef, close_font: closef, icon_font: icons, panes, hits, focus, view, menu_open, menu_sel, sub, sub_sel, text, picker, fades, themes, theme, spaces, rename, search, .. } = self;
+        let Ui { hwnd, frame, font, prose, ui_font: ui, title_font: titlef, close_font: closef, icon_font: icons, panes, hits, focus, view, menu_open, menu_sel, sub, sub_sel, text, picker, fades, themes, theme, spaces, rename, search, .. } = self;
         let th = with_accent(themes[*theme], text[4]);
         let mut cv = Canvas::new(frame.as_mut_slice(), w, h);
         cv.set_bounds(area);
@@ -1790,7 +1848,8 @@ impl Ui {
 
             cv.set_clip(inner.intersect(&content));
             let dim = 1.0 - p.lit.value();
-            draw_term(&mut cv, font, &p.term, p.scroll_pos, p.sel, &pt, *inner, on, dim);
+            let software = p.software(*text).then_some(&mut *prose);
+            draw_term(&mut cv, font, software, &p.term, p.scroll_pos, p.sel, &pt, *inner, on, dim);
             if let (true, Some((line, col))) = (p.term.at_prompt(), p.term.prompt) {
                 // the prompt mark, in the two cells the prompt leaves blank; it turns only where you are typing
                 let top = p.term.history.len() as f32 - p.scroll_pos;
@@ -1862,9 +1921,48 @@ impl Ui {
     }
 }
 
-/// `dim` (0..1) greys the text toward the background: used for inactive terminals.
+/// Whether a row reads as running text, so the Software render may draw it in a proportional font: at least three
+/// words, and nothing that relies on columns lining up (aligned gaps, box drawing, a background such as a diff's or
+/// the input cursor's) or looks like code (its punctuation, or syntax colours).
+/// ponytail: a guess from one row: an uncoloured line of code without that punctuation reads as text. Claude's output
+/// is not rewrapped either, so rows keep Claude's line breaks. Upgrade: parse the transcript instead of the screen.
+fn is_prose(line: &[Cell]) -> bool {
+    let (Some(start), Some(end)) = (line.iter().position(|c| c.ch != ' '), line.iter().rposition(|c| c.ch != ' ')) else { return false };
+    let body = &line[start..=end];
+    let mut colors = Vec::new();
+    for (i, c) in body.iter().enumerate() {
+        // `❯`: Claude's input row, which would jump off the grid while you type its third word
+        if c.bg != Color::Bg || matches!(c.ch, '\u{2500}'..='\u{259f}' | '{' | '}' | '|' | '=' | '❯') || (c.ch == ' ' && body[i + 1].ch == ' ') {
+            return false;
+        }
+        if c.ch.is_alphabetic() && !colors.contains(&c.fg) {
+            colors.push(c.fg);
+        }
+    }
+    colors.len() <= 2 && body.split(|c| c.ch == ' ').filter(|w| w.iter().any(|c| c.ch.is_alphabetic())).count() >= 3
+}
+
+/// The left edge in pixels of each column (and of the end of the last) when `line` is drawn proportionally, or None
+/// when it stays on the grid: not running text, or too wide. Indent and the blanks after the text keep the grid's `cw`.
+fn prose_xs(prose: &mut Font, cw: i32, line: &[Cell], cols: usize) -> Option<Vec<i32>> {
+    if !is_prose(line) {
+        return None;
+    }
+    let (start, end) = (line.iter().position(|c| c.ch != ' ')?, line.iter().rposition(|c| c.ch != ' ')?);
+    let (mut xs, mut x) = (Vec::with_capacity(cols + 1), 0.0);
+    for col in 0..=cols {
+        xs.push(f32::round(x) as i32);
+        x += match line.get(col) {
+            Some(c) if (start..=end).contains(&col) => if c.ch == '\0' { 0.0 } else { prose.advance(c.ch) },
+            _ => cw as f32,
+        };
+    }
+    (*xs.get(end + 1)? <= cols as i32 * cw).then_some(xs)
+}
+
+/// `dim` (0..1) greys the text toward the background: used for inactive terminals. `prose`: the Software render's font.
 #[allow(clippy::too_many_arguments)]
-fn draw_term(cv: &mut Canvas, font: &mut Font, t: &Term, scroll_pos: f32, sel: Option<(Pos, Pos)>, th: &Theme, r: Rect, focused: bool, dim: f32) {
+fn draw_term(cv: &mut Canvas, font: &mut Font, mut prose: Option<&mut Font>, t: &Term, scroll_pos: f32, sel: Option<(Pos, Pos)>, th: &Theme, r: Rect, focused: bool, dim: f32) {
     let hist = t.history.len();
     // absolute line at the top of the view; fractional while a scroll animation is running
     let top = hist as f32 - scroll_pos.clamp(0.0, hist as f32);
@@ -1883,9 +1981,11 @@ fn draw_term(cv: &mut Canvas, font: &mut Font, t: &Term, scroll_pos: f32, sel: O
             continue; // outside the area being repainted
         }
         let (first, last) = (((clip.x - r.x) / font.cw).max(0) as usize, ((clip.x + clip.w - r.x) / font.cw + 1).max(0) as usize);
-        for col in first.min(t.cols)..last.min(t.cols) {
+        let xs = prose.as_deref_mut().and_then(|f| prose_xs(f, font.cw, line, t.cols));
+        let cols = if xs.is_some() { 0..t.cols } else { first.min(t.cols)..last.min(t.cols) };
+        for col in cols {
             let cell = line.get(col).copied().unwrap_or(BLANK);
-            let x = r.x + col as i32 * font.cw;
+            let (x, w) = xs.as_ref().map_or((r.x + col as i32 * font.cw, font.cw), |v| (r.x + v[col], v[col + 1] - v[col]));
             let (mut fg, mut bg) = (mix(th.rgb(cell.fg), th.bg, 0.6 * dim), th.rgb(cell.bg));
             if cell.dim {
                 fg = mix(fg, bg, 0.5);
@@ -1899,13 +1999,29 @@ fn draw_term(cv: &mut Canvas, font: &mut Font, t: &Term, scroll_pos: f32, sel: O
                 (bg, fg) = (th.cursor, th.bg);
             }
             if bg != th.bg {
-                cv.rect(Rect { x, y, w: font.cw, h: font.ch }, bg);
+                cv.rect(Rect { x, y, w, h: font.ch }, bg);
             }
             if cell.ch != ' ' && cell.ch != '\0' {
-                cv.glyph(font, cell.ch, x, y, fg);
+                match prose.as_deref_mut().filter(|_| xs.is_some()) {
+                    Some(f) => cv.glyph(f, cell.ch, x, y, fg),
+                    None => cv.glyph(font, cell.ch, x, y, fg),
+                }
             }
         }
     }
+}
+
+/// How fast a drag selection scrolls with the pointer at height `y`, in lines per second: 0 inside the text, positive
+/// (back through history) above it, negative below it, faster the further out.
+fn edge_speed(y: i32, inner: Rect, line_h: i32) -> f32 {
+    let (over, sign) = if y < inner.y {
+        (inner.y - y, 1.0)
+    } else if y >= inner.y + inner.h {
+        (y - (inner.y + inner.h) + 1, -1.0)
+    } else {
+        return 0.0;
+    };
+    sign * (8.0 + 16.0 * over as f32 / line_h as f32).min(200.0)
 }
 
 /// Thin scrollbar on the panel's outer right edge, shown once there is scrollback. Its track starts below the
@@ -2340,7 +2456,7 @@ fn edit_key(f: &mut Picker, key: &Key, ctrl: bool, alt: bool) {
 /// a 1px separator between groups, hover/keyboard highlight. Text rows show their current choice and a "›";
 /// `sub` is the open Text submenu (and its highlighted row), drawn beside its row. `text`: see TEXT_DEFAULT.
 #[allow(clippy::too_many_arguments)]
-fn draw_menu(cv: &mut Canvas, ui: &mut Font, icons: &mut Font, c: &Chrome, text: [usize; 6], sub: Option<(usize, Option<usize>)>, hits: &mut Vec<(Rect, Action)>) {
+fn draw_menu(cv: &mut Canvas, ui: &mut Font, icons: &mut Font, c: &Chrome, text: [usize; 7], sub: Option<(usize, Option<usize>)>, hits: &mut Vec<(Rect, Action)>) {
     let (th, s) = (c.th, c.scale);
     let hover_bg = blend(th.ui_bg, th.ui_fg, 26);
     let items: Vec<(&str, bool)> = MENU_ACTIONS
@@ -2695,16 +2811,89 @@ impl App {
     }
 }
 
+/// A windowed exe has no console, so a panic would close maula without a trace: keep them in `crash.log`.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = config::config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let _ = writeln!(f, "unix time {now}, maula {}: {info}", env!("CARGO_PKG_VERSION"));
+        }
+        default(info);
+    }));
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("hook") {
         return claude::hook_main(); // run by Claude Code, see claude.rs
     }
+    log_panics();
     let cfg = config::load();
     let (window, waker) = Window::new("maula", 1280.0, 800.0, 480.0, 300.0);
     let (tx, rx) = std::sync::mpsc::channel();
     let ui = Ui::new(window, Proxy { tx, waker }, cfg);
     let mut app = App { stats: std::env::var_os("MAULA_STATS").is_some(), last_stats: Instant::now(), rx, ui };
     window::run(move |ev| app.handle(ev));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(t: &mut Term, bytes: &[u8]) -> Vec<Cell> {
+        t.feed(bytes);
+        t.line(t.history.len() + t.cy).to_vec()
+    }
+
+    #[test]
+    fn only_running_text_leaves_the_grid() {
+        let mut t = Term::new(80, 3);
+        assert!(is_prose(&row(&mut t, b"  Here is what I changed in the file.")));
+        for (bytes, why) in [
+            (&b"\r\n\x1b[2K  short label"[..], "two words"),
+            (b"\r\n\x1b[2K  name   size   date of change", "aligned columns"),
+            (b"\r\n\x1b[2K  let x = foo(bar) + baz", "code punctuation"),
+            (b"\r\n\x1b[2K\x1b[31mfn \x1b[32mmain \x1b[33mruns \x1b[34mthings\x1b[0m", "syntax colours"),
+            (b"\r\n\x1b[2K\x1b[41m  removed this line right here\x1b[0m", "a background"),
+            ("\r\n\x1b[2K│ inside a nice box │".as_bytes(), "box drawing"),
+            ("\r\n\x1b[2K❯ typing a long prompt".as_bytes(), "the input row"),
+        ] {
+            assert!(!is_prose(&row(&mut t, bytes)), "{why}");
+        }
+        assert!(is_prose(&row(&mut t, b"\r\n\x1b[2K  Use the \x1b[36mfind\x1b[0m command for this.")), "one inline code colour");
+    }
+
+    #[test]
+    fn proportional_columns_keep_the_indent_and_map_back_to_cells() {
+        let mut t = Term::new(40, 1);
+        let line = row(&mut t, b"  iii WWW tail");
+        let mut prose = Font::prose(14.0, 10);
+        let xs = prose_xs(&mut prose, 8, &line, 40).expect("running text");
+        assert_eq!(xs.len(), 41);
+        assert_eq!(xs[2], 16, "the indent stays on the grid");
+        assert!(xs.windows(2).all(|w| w[0] <= w[1]), "left to right: {xs:?}");
+        assert!(xs[3] - xs[2] < xs[7] - xs[6], "an i is narrower than a W, so it left the grid");
+        let hit = |dx: i32| xs.partition_point(|&e| e <= dx).saturating_sub(1).min(39);
+        assert_eq!(hit(xs[7] + 1), 7, "a click finds its cell");
+        assert_eq!(hit(-5), 0);
+        assert_eq!(hit(99_999), 39);
+
+        let long = row(&mut Term::new(10, 1), b"a b c MMMMMM");
+        assert_eq!(prose_xs(&mut Font::prose(40.0, 10), 8, &long, 10), None, "too wide for the panel: stays on the grid");
+    }
+
+    #[test]
+    fn a_drag_selection_scrolls_only_past_the_edges() {
+        let inner = Rect { x: 0, y: 100, w: 500, h: 200 };
+        assert_eq!(edge_speed(100, inner, 20), 0.0, "first pixel inside");
+        assert_eq!(edge_speed(299, inner, 20), 0.0, "last pixel inside");
+        assert!(edge_speed(99, inner, 20) > 0.0, "above: back through history");
+        assert!(edge_speed(300, inner, 20) < 0.0, "below: towards the live screen");
+        assert!(edge_speed(0, inner, 20) > edge_speed(90, inner, 20), "faster the further out");
+        assert_eq!(edge_speed(-100_000, inner, 20), 200.0, "capped");
+    }
 }
 
 /// Dev tool, not part of the app: renders the real header + dropdown (the same functions the app calls) in both
@@ -2929,7 +3118,7 @@ mod header_preview {
                 let mut t = Term::new((inner.w / font.cw) as usize, (inner.h / font.ch) as usize);
                 t.feed(b"PS D:\\work\\maula> cargo run\r\n   Compiling maula v0.1.0\r\n    Finished dev in 1.2s\r\nPS D:\\work\\maula> ");
                 cv.set_clip(inner);
-                draw_term(&mut cv, &mut font, &t, 0.0, None, &th, inner, k == 0, if k == 0 { 0.0 } else { 1.0 }); // card view: inactive greyed
+                draw_term(&mut cv, &mut font, None, &t, 0.0, None, &th, inner, k == 0, if k == 0 { 0.0 } else { 1.0 }); // card view: inactive greyed
                 if k == 2 {
                     cv.set_clip(outer);
                     cv.rrect(outer, 0, th.bg, 128); // halfway through fading in
@@ -2982,8 +3171,8 @@ mod header_preview {
     #[test]
     fn accent_and_maximize_come_from_the_config() {
         let c = config::parse_config("accent = \"Blue\"\nmaximize = \"window\"").unwrap();
-        assert_eq!(text_of(&c)[4..], [2, 1]);
-        assert_eq!(text_of(&Config::default())[4..], [0, 0], "unset: the theme's own accent, borderless fullscreen");
+        assert_eq!(text_of(&c)[4..], [2, 1, 0]);
+        assert_eq!(text_of(&Config::default())[4..], [0, 0, 0], "unset: the theme's own accent, borderless fullscreen, terminal render");
         let t = with_accent(Theme::dark(), 2);
         assert_eq!((t.accent, t.cursor, t.on_accent), (0x4f86d9, 0x4f86d9, 0xffffff));
         assert_eq!(with_accent(Theme::dark(), 0).accent, Theme::dark().accent);
@@ -3097,7 +3286,7 @@ mod header_preview {
         let mut darkest = |dim: f32| {
             let mut buf = vec![th.bg; (w * h) as usize];
             let mut cv = Canvas::new(&mut buf, w, h);
-            draw_term(&mut cv, &mut font, &t, 0.0, None, &th, Rect { x: 0, y: 0, w, h }, false, dim);
+            draw_term(&mut cv, &mut font, None, &t, 0.0, None, &th, Rect { x: 0, y: 0, w, h }, false, dim);
             buf.iter().map(|p| (p & 0xff) as i32).min().unwrap() // darkest blue channel: the ink
         };
         let (live, dimmed) = (darkest(0.0), darkest(1.0));
@@ -3200,7 +3389,7 @@ mod header_preview {
             let mut buf = vec![th.bg; (w * h) as usize];
             let mut cv = Canvas::new(&mut buf, w, h);
             cv.set_clip(r);
-            draw_term(&mut cv, &mut font, &t, pos, None, &th, r, true, 0.0);
+            draw_term(&mut cv, &mut font, None, &t, pos, None, &th, r, true, 0.0);
             all.extend(buf);
             all.extend(vec![0x808080; w as usize * 4]);
             total += h + 4;
@@ -3293,7 +3482,7 @@ mod frame_cost {
                 cv.rect(outer, th.bg);
                 draw_panel_header(&mut cv, titlef, closef, icons, &th, scale, Rect { x: outer.x, y: outer.y, w: outer.w - 1, h: hh }, k, "maula", Some('C'), k == 0, false, false, &none);
                 cv.set_clip(inner);
-                draw_term(&mut cv, font, t, 0.0, None, &th, inner, k == 0, 0.0);
+                draw_term(&mut cv, font, None, t, 0.0, None, &th, inner, k == 0, 0.0);
             }
         };
         let all = Rect { x: 0, y: 0, w, h };
@@ -3360,7 +3549,7 @@ mod card_layouts {
                     draw_panel_header(&mut cv, &mut titlef, &mut closef, &mut icons, &th, scale, Rect { x: outer.x, y: outer.y, w: outer.w - 1, h: hh }, k, "maula", Some('C'), k == 0, false, false, &none);
                     let inner = pane_inner(*outer, scale);
                     cv.set_clip(inner.intersect(&content));
-                    draw_term(&mut cv, &mut font, t, 0.0, None, &th, inner, k == 0, 0.0);
+                    draw_term(&mut cv, &mut font, None, t, 0.0, None, &th, inner, k == 0, 0.0);
                 }
             };
             frame(&mut buf);

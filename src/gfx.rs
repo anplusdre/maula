@@ -106,6 +106,18 @@ impl Font {
         Self::with(Face::parse(BUNDLED_MEDIUM).unwrap(), px)
     }
 
+    /// Segoe UI, for running text that shares rows with the terminal font: `ascent` is that font's, so baselines line up.
+    /// Without Segoe UI (it ships with Windows), the bundled font.
+    pub fn prose(px: f32, ascent: i32) -> Self {
+        let face = load(r"C:\Windows\Fonts\segoeui.ttf").or_else(|| Face::parse(BUNDLED)).expect("no font found");
+        Font { ascent, ..Self::with(face, px) }
+    }
+
+    /// How far the pen moves after `c`.
+    pub fn advance(&mut self, c: char) -> f32 {
+        self.glyph(c).adv
+    }
+
     /// Icon font: a 2 KB subset of Lucide (ISC license, see assets/).
     pub fn icons(px: f32) -> Self {
         Self::with(Face::parse(LUCIDE).unwrap(), px)

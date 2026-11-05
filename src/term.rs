@@ -351,6 +351,11 @@ impl Term {
         l
     }
 
+    /// A full-screen program is up.
+    pub fn alt_screen(&self) -> bool {
+        self.alt.is_some()
+    }
+
     /// The shell is waiting at its prompt: the cursor's line is the one the last prompt started.
     pub fn at_prompt(&self) -> bool {
         self.alt.is_none() && self.prompt.is_some_and(|(l, _)| l == self.line_start())

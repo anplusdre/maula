@@ -43,6 +43,7 @@ The dropdown sets the theme and its accent colour, the view, what maximize does 
 ### Claude Code integration
 
 - **Install hooks** (dropdown → Claude) adds maula's hooks to every Claude account's `settings.json`, and keeps a backup as `settings.json.maula-bak`. maula then knows which session runs in which panel and when Claude stops or asks something.
+- **Render** (dropdown → Claude): *Terminal* is the character grid. *Software* draws Claude's running text in a proportional font, as a desktop app would, and keeps code, tables and diagrams on the grid. It applies to panels where the hooks report Claude running, on its classic renderer.
 - **MEMORY** (panel header): while it's on, a summary of the session (what you needed, the decisions made, open items) is saved to `.maula/memory` in the project, so a later session or another account can pick it up.
 
 ### Terminal niceties
@@ -50,6 +51,7 @@ The dropdown sets the theme and its accent colour, the view, what maximize does 
 - The panel header shows the drive and folder, each with a picker to jump elsewhere.
 - Typing `cd` plus three or more characters suggests matching sub-folders.
 - Ctrl+click opens links in the browser and `path:line:col` in your editor (`editor = "code -g"`).
+- To select more than fits on screen, drag past the top or bottom of a panel, or use the wheel while dragging.
 - Ctrl+C copies while text is selected; otherwise it sends ^C.
 - Programs that use the mouse (Claude Code's full-screen view, vim, htop) get the wheel, clicks and focus changes; hold Shift to select text or scroll maula's own scrollback instead.
 
@@ -91,6 +93,7 @@ theme = "dark"        # light | dark | friendly
 view = "space"        # space | grid | carousel
 accent = "default"    # default | terracotta | blue | teal | violet | rose
 maximize = "fullscreen" # fullscreen (borderless) | window
+render = "terminal"   # terminal | software (panels running Claude)
 # shell = "C:/Program Files/Git/bin/bash.exe"
 # editor = "code -g"
 # theme_colors = true # recolour programs (Claude Code included) to the theme palette
@@ -102,6 +105,10 @@ cmd = "claude"
 ```
 
 Each theme's colours can be overridden under `[light]`, `[dark]` or `[friendly]`. Each panel can override them with its own `bg` and `accent`.
+
+## Troubleshooting
+
+If maula closes unexpectedly, look in `%APPDATA%\maula\crash.log`: every panic is added there with its source file and line. Include it when you report a bug.
 
 ## License
 
