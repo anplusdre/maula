@@ -1,0 +1,18 @@
+maula - Copyright (c) 2026 Andre Ramadhan. All rights reserved.
+
+This software is proprietary. The compiled program is provided free of charge
+for personal use, as is, without warranty of any kind. No source code is
+licensed to you.
+
+You may NOT, without prior written permission from the copyright holder:
+  - copy, modify, merge, publish or distribute the source code;
+  - reverse engineer, decompile or disassemble the program, except where
+    applicable law permits it despite this restriction;
+  - sell, sublicense or redistribute the program or any derivative of it.
+
+Versions released before this notice (0.1.0 and 0.1.1 source) were published
+under the MIT License; that grant stays valid for the copies already received
+under it, but does not apply to any later version.
+
+Third-party components bundled with the program keep their own licenses, see
+the "licenses" folder of the installation.
